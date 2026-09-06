@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Modern126Gameplay.h"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -17,8 +18,8 @@
 #pragma comment(lib, "dxgi.lib")
 
 // Stable current-Bedrock overlay path: IDXGISwapChain::Present -> D3D11On12 ->
-// Direct2D/DirectWrite. This layer contains only renderer/HUD features; gameplay
-// memory modules stay disabled until their 1.26 layouts are validated separately.
+// Direct2D/DirectWrite. Gameplay mutations live in Modern126Gameplay and are
+// only toggled from this UI after their current 1.26 paths are validated.
 namespace Modern126PresentProbe {
 	inline std::unique_ptr<FuncHook> presentHook;
 	inline std::unique_ptr<FuncHook> executeCommandListsHook;
@@ -61,7 +62,7 @@ namespace Modern126PresentProbe {
 	inline bool mouseValid = false;
 	inline bool leftWasDown = false;
 
-	// Modern renderer-only modules.
+	// Renderer/HUD modules.
 	inline bool crosshairEnabled = false;
 	inline bool watermarkEnabled = false;
 	inline bool fpsEnabled = false;
@@ -394,6 +395,8 @@ namespace Modern126PresentProbe {
 		if (watermarkEnabled) drawEntry(L"Watermark");
 		if (fpsEnabled) drawEntry(L"FPS Counter");
 		if (moduleListEnabled) drawEntry(L"Module List");
+		if (Modern126Gameplay::isAutoSprintEnabled()) drawEntry(L"AutoSprint");
+		if (Modern126Gameplay::isFlyEnabled()) drawEntry(L"Fly");
 	}
 
 	inline void logFeatureToggle(const char* name, bool enabled) {
@@ -423,10 +426,15 @@ namespace Modern126PresentProbe {
 		const D2D1_RECT_F watermarkButton = { 318.0f, 116.0f, 566.0f, 157.0f };
 		const D2D1_RECT_F fpsButton = { 318.0f, 168.0f, 566.0f, 209.0f };
 		const D2D1_RECT_F moduleListButton = { 318.0f, 220.0f, 566.0f, 261.0f };
+		const D2D1_RECT_F autoSprintButton = { 598.0f, 116.0f, 846.0f, 157.0f };
+		const D2D1_RECT_F flyButton = { 598.0f, 168.0f, 846.0f, 209.0f };
+
 		bool hoverCrosshair = false;
 		bool hoverWatermark = false;
 		bool hoverFps = false;
 		bool hoverModuleList = false;
+		bool hoverAutoSprint = false;
+		bool hoverFly = false;
 
 		if (Modern126Overlay::visible) {
 			updateMouse();
@@ -434,6 +442,9 @@ namespace Modern126PresentProbe {
 			hoverWatermark = mouseValid && pointInside(mouseClient, watermarkButton);
 			hoverFps = mouseValid && pointInside(mouseClient, fpsButton);
 			hoverModuleList = mouseValid && pointInside(mouseClient, moduleListButton);
+			hoverAutoSprint = mouseValid && pointInside(mouseClient, autoSprintButton);
+			hoverFly = mouseValid && pointInside(mouseClient, flyButton);
+
 			const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 			if (leftDown && !leftWasDown) {
 				if (hoverCrosshair) {
@@ -448,6 +459,10 @@ namespace Modern126PresentProbe {
 				} else if (hoverModuleList) {
 					moduleListEnabled = !moduleListEnabled;
 					logFeatureToggle("HUD/Module List", moduleListEnabled);
+				} else if (hoverAutoSprint) {
+					Modern126Gameplay::setAutoSprintEnabled(!Modern126Gameplay::isAutoSprintEnabled());
+				} else if (hoverFly) {
+					Modern126Gameplay::setFlyEnabled(!Modern126Gameplay::isFlyEnabled());
 				}
 			}
 			leftWasDown = leftDown;
@@ -462,20 +477,23 @@ namespace Modern126PresentProbe {
 		d2dContext->BeginDraw();
 
 		if (Modern126Overlay::visible) {
-			const D2D1_RECT_F panel = { 24.0f, 24.0f, 580.0f, 318.0f };
-			const D2D1_RECT_F header = { 24.0f, 24.0f, 580.0f, 62.0f };
+			const D2D1_RECT_F panel = { 24.0f, 24.0f, 860.0f, 318.0f };
+			const D2D1_RECT_F header = { 24.0f, 24.0f, 860.0f, 62.0f };
 			d2dContext->FillRectangle(panel, panelBrush);
 			d2dContext->FillRectangle(header, headerBrush);
 
 			static const wchar_t title[] = L"HORION 1.26";
 			static const wchar_t visuals[] = L"VISUALS";
 			static const wchar_t hud[] = L"HUD";
-			const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 570.0f, 59.0f };
+			static const wchar_t movement[] = L"MOVEMENT";
+			const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 850.0f, 59.0f };
 			const D2D1_RECT_F visualsRect = { 38.0f, 78.0f, 286.0f, 105.0f };
 			const D2D1_RECT_F hudRect = { 318.0f, 78.0f, 566.0f, 105.0f };
+			const D2D1_RECT_F movementRect = { 598.0f, 78.0f, 846.0f, 105.0f };
 			d2dContext->DrawText(title, _countof(title) - 1, titleFormat, titleRect, textBrush);
 			d2dContext->DrawText(visuals, _countof(visuals) - 1, bodyFormat, visualsRect, textBrush);
 			d2dContext->DrawText(hud, _countof(hud) - 1, bodyFormat, hudRect, textBrush);
+			d2dContext->DrawText(movement, _countof(movement) - 1, bodyFormat, movementRect, textBrush);
 
 			const auto drawToggle = [&](const D2D1_RECT_F& rect, bool enabled, bool hovered,
 				const wchar_t* onText, const wchar_t* offText) {
@@ -490,11 +508,15 @@ namespace Modern126PresentProbe {
 			drawToggle(watermarkButton, watermarkEnabled, hoverWatermark, L"WATERMARK: ON", L"WATERMARK: OFF");
 			drawToggle(fpsButton, fpsEnabled, hoverFps, L"FPS COUNTER: ON", L"FPS COUNTER: OFF");
 			drawToggle(moduleListButton, moduleListEnabled, hoverModuleList, L"MODULE LIST: ON", L"MODULE LIST: OFF");
+			drawToggle(autoSprintButton, Modern126Gameplay::isAutoSprintEnabled(), hoverAutoSprint,
+				L"AUTOSPRINT: ON", L"AUTOSPRINT: OFF");
+			drawToggle(flyButton, Modern126Gameplay::isFlyEnabled(), hoverFly,
+				L"FLY: ON", L"FLY: OFF");
 
-			static const wchar_t note[] = L"Renderer-only modules - gameplay modules remain disabled";
-			static const wchar_t footer[] = L"INSERT closes menu   |   CTRL+L unloads";
-			const D2D1_RECT_F noteRect = { 38.0f, 270.0f, 570.0f, 292.0f };
-			const D2D1_RECT_F footerRect = { 38.0f, 292.0f, 570.0f, 314.0f };
+			static const wchar_t note[] = L"Fly controls: close menu, then WASD + Space/Shift";
+			static const wchar_t footer[] = L"INSERT closes menu   |   F6 AutoSprint   |   F7 Fly   |   CTRL+L unloads";
+			const D2D1_RECT_F noteRect = { 38.0f, 270.0f, 850.0f, 292.0f };
+			const D2D1_RECT_F footerRect = { 38.0f, 292.0f, 850.0f, 314.0f };
 			d2dContext->DrawText(note, _countof(note) - 1, bodyFormat, noteRect, textBrush);
 			d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
 		}
@@ -517,7 +539,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D feature UI rendered successfully; Visuals + HUD modules ready");
+			logF("[modern] Present Direct2D feature UI rendered successfully; Visuals + HUD + Movement ready");
 		}
 	}
 
@@ -538,14 +560,16 @@ namespace Modern126PresentProbe {
 
 			const char* api = SUCCEEDED(hr12) && device12 != nullptr ? "DX12" :
 				(SUCCEEDED(hr11) && device11 != nullptr ? "DX11" : "UNKNOWN");
-			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/W%d/F%d/L%d",
+			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/W%d/F%d/L%d AS%d/FL%d",
 				static_cast<unsigned long long>(presentCount),
 				reinterpret_cast<uintptr_t>(chain), api,
 				reinterpret_cast<uintptr_t>(capturedCommandQueue),
 				Modern126Overlay::visible ? "ON" : "OFF",
 				rendererReady ? "READY" : "WAIT",
 				crosshairEnabled ? 1 : 0, watermarkEnabled ? 1 : 0,
-				fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0);
+				fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0,
+				Modern126Gameplay::isAutoSprintEnabled() ? 1 : 0,
+				Modern126Gameplay::isFlyEnabled() ? 1 : 0);
 			loggedPresent = true;
 			lastPresentLogTick = now;
 
@@ -670,7 +694,7 @@ namespace Modern126PresentProbe {
 		started = true;
 		logF("[modern] DXGI Present renderer installed Present=%llX ExecuteCommandLists=%llX",
 			presentTarget, executeTarget);
-		logF("[modern] Modern module layer registered: Visuals/Crosshair, HUD/Watermark, HUD/FPS Counter, HUD/Module List");
+		logF("[modern] Modern module layer registered: Visuals/Crosshair, HUD/Watermark/FPS/ModuleList, Movement/AutoSprint/Fly");
 		return true;
 	}
 
