@@ -6,6 +6,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
+#include <winver.h>
 
 #include <iostream>
 #include <string>
@@ -32,6 +33,8 @@
 #include "Module/ModuleManager.h"
 #include "ImmediateGui.h"
 
+#pragma comment(lib, "Version.lib")
+
 // Loader.cpp defines this flag. The compatibility shim uses it to stop the
 // injector-connection thread when the archived signatures no longer match the
 // running Minecraft build.
@@ -48,6 +51,62 @@ private:
 		const char* name;
 		const char* pattern;
 	};
+
+	static void logMinecraftBinaryInfo() {
+		HMODULE gameModuleHandle = GetModuleHandleA("Minecraft.Windows.exe");
+		if (gameModuleHandle == nullptr) {
+			logF("[compat] Minecraft binary handle unavailable");
+			return;
+		}
+
+		char path[MAX_PATH] = {};
+		if (GetModuleFileNameA(gameModuleHandle, path, MAX_PATH) == 0) {
+			logF("[compat] Could not resolve Minecraft executable path (error %lu)", GetLastError());
+			return;
+		}
+
+		logF("[compat] Minecraft executable: %s", path);
+
+		DWORD dummy = 0;
+		DWORD versionSize = GetFileVersionInfoSizeA(path, &dummy);
+		if (versionSize == 0) {
+			logF("[compat] Minecraft file version unavailable (error %lu)", GetLastError());
+			return;
+		}
+
+		std::vector<unsigned char> versionData(versionSize);
+		if (!GetFileVersionInfoA(path, 0, versionSize, versionData.data())) {
+			logF("[compat] GetFileVersionInfo failed (error %lu)", GetLastError());
+			return;
+		}
+
+		VS_FIXEDFILEINFO* fixedInfo = nullptr;
+		UINT fixedInfoSize = 0;
+		if (!VerQueryValueA(versionData.data(), "\\", reinterpret_cast<void**>(&fixedInfo), &fixedInfoSize) ||
+			fixedInfo == nullptr || fixedInfoSize < sizeof(VS_FIXEDFILEINFO)) {
+			logF("[compat] Minecraft version resource could not be read");
+			return;
+		}
+
+		logF("[compat] Minecraft file version: %u.%u.%u.%u",
+			HIWORD(fixedInfo->dwFileVersionMS),
+			LOWORD(fixedInfo->dwFileVersionMS),
+			HIWORD(fixedInfo->dwFileVersionLS),
+			LOWORD(fixedInfo->dwFileVersionLS));
+	}
+
+	static int scanSignatures(const char* label, const SignatureCheck* checks, size_t count) {
+		logF("[compat] ---- %s ----", label);
+		int found = 0;
+		for (size_t i = 0; i < count; ++i) {
+			const uintptr_t address = FindSignature(checks[i].pattern);
+			logF("[compat] %-32s %s @ %llX", checks[i].name, address != 0 ? "FOUND" : "MISSING", address);
+			if (address != 0)
+				++found;
+		}
+		logF("[compat] %s: %i/%llu candidates matched", label, found, static_cast<unsigned long long>(count));
+		return found;
+	}
 
 	[[noreturn]] static void abortStartup(const char* reason) {
 		logF("[compat] Startup stopped safely: %s", reason);
@@ -70,33 +129,52 @@ public:
 			abortStartup("Minecraft.Windows.exe module could not be resolved");
 
 		logF("[compat] Minecraft module base: %llX", module->ptrBase);
+		logMinecraftBinaryInfo();
 
-		// These are the first signatures the archived startup path relies on.
-		// We intentionally check them before GameData::initGameData / Hooks::Init
-		// because the old code dereferences some of them before checking for 0.
-		const SignatureCheck checks[] = {
-			{"ClientInstance", "48 8B 15 ? ? ? ? 4C 8B 02 4C 89 06 40 84 FF 74 ? 48 8B CD E8 ? ? ? ? 48 8B C6 48 8B 4C 24 ? 48 33 CC E8 ? ? ? ? 48 8B 5C 24 ? 48 8B 6C 24 ? 48 8B 74 24 ? 48 83 C4 ? 5F C3 B9 ? ? ? ? E8 ? ? ? ? CC E8 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 ? 48 89 6C 24 ? 56"},
-			{"KeyMap", "48 8D 0D ?? ?? ?? ?? 89 1C B9"},
-			{"GameMode vtable", "48 8D 05 ? ? ? ? 48 8B D9 48 89 01 8B FA 48 8B 89 ? ? ? ? 48 85 C9 74 ? 48 8B 01 BA ? ? ? ? FF 10 48 8B 8B"},
-			{"BlockLegacy vtable", "48 8D 05 ? ? ? ? 48 89 01 4C 8B 72 ? 48 B9"},
-			{"LocalPlayer vtable", "48 8D 05 ?? ?? ?? ?? 48 89 07 48 8D 8F ?? ?? ?? ?? 48 8B 87"},
-			{"MoveInputHandler vtable", "48 8D 0D ? ? ? ? 49 89 48 ? 49 89 80 ? ? ? ? 49 89 80 ? ? ? ? 48 39 87 ? ? ? ? 74 20 48 8B 8F"},
-			{"Player::tickWorld", "48 89 5C 24 ?? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 0F 29 B4 24 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 ?? 48 89 55 ?? 48 8B F9"},
-			{"RenderText", "48 8B C4 48 89 58 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 0F 29 70 B8 0F 29 78 A8 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 ? ? ? ? 4C 8B FA 48 89 54 24 ? 4C 8B E9"}
+		// First determine whether the archived Horion 1.18-era memory model still
+		// resembles the running build. Never dereference these results here.
+		const SignatureCheck archivedChecks[] = {
+			{"ClientInstance (archived)", "48 8B 15 ? ? ? ? 4C 8B 02 4C 89 06 40 84 FF 74 ? 48 8B CD E8 ? ? ? ? 48 8B C6 48 8B 4C 24 ? 48 33 CC E8 ? ? ? ? 48 8B 5C 24 ? 48 8B 6C 24 ? 48 8B 74 24 ? 48 83 C4 ? 5F C3 B9 ? ? ? ? E8 ? ? ? ? CC E8 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 ? 48 89 6C 24 ? 56"},
+			{"KeyMap (archived)", "48 8D 0D ?? ?? ?? ?? 89 1C B9"},
+			{"GameMode vtable (archived)", "48 8D 05 ? ? ? ? 48 8B D9 48 89 01 8B FA 48 8B 89 ? ? ? ? 48 85 C9 74 ? 48 8B 01 BA ? ? ? ? FF 10 48 8B 8B"},
+			{"BlockLegacy vtable (archived)", "48 8D 05 ? ? ? ? 48 89 01 4C 8B 72 ? 48 B9"},
+			{"LocalPlayer vtable (archived)", "48 8D 05 ?? ?? ?? ?? 48 89 07 48 8D 8F ?? ?? ?? ?? 48 8B 87"},
+			{"MoveInput vtable (archived)", "48 8D 0D ? ? ? ? 49 89 48 ? 49 89 80 ? ? ? ? 49 89 80 ? ? ? ? 48 39 87 ? ? ? ? 74 20 48 8B 8F"},
+			{"Player::tickWorld (archived)", "48 89 5C 24 ?? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 0F 29 B4 24 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 ?? 48 89 55 ?? 48 8B F9"},
+			{"RenderText (archived)", "48 8B C4 48 89 58 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 0F 29 70 B8 0F 29 78 A8 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 ? ? ? ? 4C 8B FA 48 89 54 24 ? 4C 8B E9"}
 		};
 
-		bool allFound = true;
-		for (const auto& check : checks) {
-			const uintptr_t address = FindSignature(check.pattern);
-			logF("[compat] %-24s %s @ %llX", check.name, address != 0 ? "FOUND" : "MISSING", address);
-			if (address == 0)
-				allFound = false;
+		const int archivedFound = scanSignatures(
+			"Archived Horion 1.18 signature set",
+			archivedChecks,
+			sizeof(archivedChecks) / sizeof(archivedChecks[0]));
+
+		if (archivedFound != static_cast<int>(sizeof(archivedChecks) / sizeof(archivedChecks[0]))) {
+			// These candidates come from a newer open-source Horion-derived codebase
+			// targeting Bedrock 1.21.130. They are diagnostic only: Xorion itself
+			// marks that target as not-yet-working, so matching a candidate is not
+			// enough to safely install a hook. The results tell us whether your
+			// binary is in the same general generation before we port layouts/indexes.
+			const SignatureCheck newerCandidates[] = {
+				{"ClientInstance candidate", "48 89 0D ? ? ? ? 48 89 0D ? ? ? ? 48 85 C0 74 ? 48 8B C8 E8 ? ? ? ? 48 8B 0D ? ? ? ?"},
+				{"Key input hook candidate", "48 83 EC ? 0F B6 C1 4C 8D 05"},
+				{"GameMode vtable candidate", "48 8D 05 ? ? ? ? 48 89 01 48 89 51 ? 48 C7 41 ? ? ? ? ? C7 41"},
+				{"RenderText candidate", "48 8B C4 48 89 58 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 0F 29 70 ? 0F 29 78 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 ? ? ? ? 4C 8B F2 48 89 54 ? ? 4C 8B E9"},
+				{"UI render candidate", "48 89 5C ? ? 48 89 74 ? ? 57 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 ? ? ? ? ? 48 8B FA 48 8B D9 B9"},
+				{"MoveInput tick candidate", "48 89 5C ? ? 55 56 57 41 56 41 57 48 8B EC 48 83 EC ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 ? 49 8B 01"},
+				{"LocalPlayer camera candidate", "48 8B C4 48 89 70 ? 57 48 81 EC ? ? ? ? 0F 29 70 ? 0F 29 78"},
+				{"HID key/mouse candidate", "48 89 5C ? ? 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 81 EC ? ? ? ? ? ? 74 24 ? ? ? 7C 24 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 ? 49 8B F8"}
+			};
+
+			scanSignatures(
+				"Newer 1.21.130-derived diagnostic candidates",
+				newerCandidates,
+				sizeof(newerCandidates) / sizeof(newerCandidates[0]));
+
+			abortStartup("archived signatures are stale; newer candidate results were logged");
 		}
 
-		if (!allFound)
-			abortStartup("one or more archived 1.18-era signatures are missing");
-
-		logF("[compat] Critical signatures matched; entering archived GameData initialization");
+		logF("[compat] Critical archived signatures matched; entering archived GameData initialization");
 		::GameData::initGameData(module, slimMem, hDllInst);
 
 		if (g_Data.getClientInstance() == nullptr)
