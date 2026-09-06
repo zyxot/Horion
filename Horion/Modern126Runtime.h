@@ -20,9 +20,14 @@ namespace Modern126Runtime {
 	inline HMODULE dllModule = nullptr;
 	inline std::unique_ptr<FuncHook> screenViewHook;
 	inline std::unique_ptr<FuncHook> minecraftUpdateHook;
+	inline std::unique_ptr<FuncHook> grabCursorHook;
+	inline uintptr_t releaseCursorTarget = 0;
+	inline bool cursorReleasedForOverlay = false;
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
 	inline bool loggedDebugScreenLayer = false;
+	inline bool loggedCursorBridge = false;
+	inline bool loggedCursorUnavailable = false;
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -83,10 +88,67 @@ namespace Modern126Runtime {
 		return localPlayer;
 	}
 
+	// Current clients try to re-grab the cursor during normal gameplay. While the
+	// Horion UI is visible, suppress only that cursor-grab request so the pointer
+	// remains available for the local UI. The original call is used normally when
+	// the overlay is closed.
+	inline void __fastcall grabCursorDetour(void* instance) {
+		if (Modern126Overlay::visible)
+			return;
+		if (!grabCursorHook)
+			return;
+		auto original = grabCursorHook->GetFastcall<void, void*>();
+		original(instance);
+	}
+
+	inline void restoreGameplayCursor() {
+		if (!cursorReleasedForOverlay)
+			return;
+
+		// Only re-grab in an active gameplay session. If the player disappeared
+		// (for example, returning to the title screen), leave cursor ownership to
+		// Minecraft instead of calling gameplay cursor code on stale state.
+		if (clientInstance != nullptr && localPlayer != nullptr && grabCursorHook) {
+			auto originalGrab = grabCursorHook->GetFastcall<void, void*>();
+			originalGrab(clientInstance);
+			logF("[modern] Gameplay cursor restored to Minecraft");
+		}
+		cursorReleasedForOverlay = false;
+	}
+
+	inline void syncCursorForOverlay() {
+		if (!grabCursorHook || releaseCursorTarget == 0 || clientInstance == nullptr) {
+			if (!Modern126Overlay::visible && cursorReleasedForOverlay)
+				cursorReleasedForOverlay = false;
+			return;
+		}
+
+		if (Modern126Overlay::visible) {
+			if (localPlayer == nullptr) {
+				cursorReleasedForOverlay = false;
+				return;
+			}
+
+			if (!cursorReleasedForOverlay) {
+				using ReleaseCursorFn = void(__fastcall*)(void*);
+				auto releaseCursor = reinterpret_cast<ReleaseCursorFn>(releaseCursorTarget);
+				releaseCursor(clientInstance);
+				ClipCursor(nullptr);
+				SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+				cursorReleasedForOverlay = true;
+				logF("[modern] Gameplay cursor released for Horion UI");
+			}
+			return;
+		}
+
+		restoreGameplayCursor();
+	}
+
 	inline void __fastcall minecraftUpdateDetour(void* game) {
 		auto original = minecraftUpdateHook->GetFastcall<void, void*>();
 		original(game);
 		refreshLocalPlayer();
+		syncCursorForOverlay();
 		if (!loggedUpdateHook) {
 			loggedUpdateHook = true;
 			logF("[modern] MinecraftGame::_update hook entered successfully");
@@ -119,6 +181,14 @@ namespace Modern126Runtime {
 			return;
 
 		logF("[modern] Disabling 1.26 compatibility hooks");
+
+		// Restore normal gameplay cursor ownership before removing the grab hook.
+		restoreGameplayCursor();
+		if (grabCursorHook)
+			grabCursorHook->enableHook(false);
+		grabCursorHook.reset();
+		releaseCursorTarget = 0;
+
 		Modern126PresentProbe::shutdown();
 		if (screenViewHook)
 			screenViewHook->enableHook(false);
@@ -230,6 +300,23 @@ namespace Modern126Runtime {
 		screenViewHook->enableHook();
 		minecraftUpdateHook->enableHook();
 		hooksEnabled = true;
+
+		// Cursor lifecycle support is deliberately optional: failure to resolve it
+		// must never take down the already-validated renderer/runtime bridge.
+		const uintptr_t grabCursorTarget = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 48 83 EC");
+		const uintptr_t releaseCursorCandidate = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 53");
+		if (addressInMinecraft(grabCursorTarget) && addressInMinecraft(releaseCursorCandidate) &&
+			grabCursorTarget != releaseCursorCandidate) {
+			releaseCursorTarget = releaseCursorCandidate;
+			grabCursorHook = std::make_unique<FuncHook>(grabCursorTarget, reinterpret_cast<void*>(grabCursorDetour));
+			grabCursorHook->enableHook();
+			loggedCursorBridge = true;
+			logF("[modern] Gameplay cursor bridge installed grab=%llX release=%llX",
+				grabCursorTarget, releaseCursorTarget);
+		} else if (!loggedCursorUnavailable) {
+			loggedCursorUnavailable = true;
+			logF("[modern] Gameplay cursor bridge unavailable; INSERT UI remains render-only");
+		}
 
 		Modern126PresentProbe::start();
 
