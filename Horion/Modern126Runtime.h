@@ -78,7 +78,7 @@ namespace Modern126Runtime {
 	inline void __fastcall screenViewDetour(void* view, void* renderContext) {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
 		original(view, renderContext);
-		Modern126Overlay::render(renderContext);
+		Modern126Overlay::render(renderContext, guiData);
 		refreshLocalPlayer();
 		g_Data.frameCount++;
 		if (!loggedScreenHook) {
