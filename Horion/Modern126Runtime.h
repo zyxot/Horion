@@ -26,6 +26,9 @@ namespace Modern126Runtime {
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
 	inline bool loggedDebugScreenLayer = false;
+	inline uint64_t debugOverlayPassCount = 0;
+	inline DWORD lastDebugOverlayLogTick = 0;
+	inline uintptr_t lastDebugOverlayContext = 0;
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -49,9 +52,7 @@ namespace Modern126Runtime {
 
 	// ScreenView::setupAndRender is invoked for multiple UI layers. The maintained
 	// current client renders Minecraft-backed HUD/UI content specifically on the
-	// "debug_screen" VisualTree layer. Drawing our panel on every ScreenView pass
-	// caused later layer passes to redraw the rectangles after an earlier text
-	// flush, which matches the observed one-frame text flash.
+	// "debug_screen" VisualTree layer.
 	inline bool isDebugScreenViewUnsafe(void* view) {
 		if (view == nullptr)
 			return false;
@@ -113,6 +114,21 @@ namespace Modern126Runtime {
 				loggedDebugScreenLayer = true;
 				logF("[modern] debug_screen UI layer selected for overlay rendering");
 			}
+
+			if (Modern126Overlay::visible) {
+				++debugOverlayPassCount;
+				const DWORD now = GetTickCount();
+				const uintptr_t ctx = reinterpret_cast<uintptr_t>(renderContext);
+				const bool contextChanged = ctx != lastDebugOverlayContext;
+				if (debugOverlayPassCount <= 12 || contextChanged || (now - lastDebugOverlayLogTick) >= 1000) {
+					logF("[modern] debug_screen overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
+						static_cast<unsigned long long>(debugOverlayPassCount),
+						reinterpret_cast<uintptr_t>(view), ctx, contextChanged ? "YES" : "NO");
+					lastDebugOverlayLogTick = now;
+				}
+				lastDebugOverlayContext = ctx;
+			}
+
 			Modern126Overlay::render(renderContext, guiData, minecraftGame);
 		}
 
@@ -166,9 +182,6 @@ namespace Modern126Runtime {
 	}
 
 	inline bool tryStart(HMODULE module) {
-		// Only activate this bridge when the signatures verified on the user's
-		// Minecraft.Windows.exe 1.26.45.1 are all present. Otherwise the archived
-		// diagnostic path remains in control and fails closed.
 		const uintptr_t platformSig = FindSignature("4C 89 3D ? ? ? ? 4D 85 FF");
 		const uintptr_t clientVtableSig = FindSignature("48 8D 05 ? ? ? ? 49 89 45 00 48 8D 05 ? ? ? ? 49 89 45 18 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ? 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ?");
 		const uintptr_t keyMapSig = FindSignature("48 8D 3D ? ? ? ? C7 04 B7");
