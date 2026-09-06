@@ -138,7 +138,9 @@ namespace Modern126Gameplay {
 		if (!resolveFlyComponents(localPlayer, &state, &rotation) || state == nullptr)
 			return;
 		__try {
-			state->velocity = { 0.0f, 0.0f, 0.0f };
+			// Fly owns only the vertical channel. Preserve Minecraft's native X/Z
+			// movement when the module is disabled so there is no horizontal snap.
+			state->velocity.y = 0.0f;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 		}
@@ -213,40 +215,25 @@ namespace Modern126Gameplay {
 		}
 
 		__try {
-			float forward = 0.0f;
-			float strafe = 0.0f;
 			float vertical = 0.0f;
-			if (keyMap['W'] != 0) forward += 1.0f;
-			if (keyMap['S'] != 0) forward -= 1.0f;
-			if (keyMap['D'] != 0) strafe += 1.0f;
-			if (keyMap['A'] != 0) strafe -= 1.0f;
-			if (keyMap[VK_SPACE] != 0) vertical += 1.0f;
-			if (keyMap[VK_SHIFT] != 0 || keyMap[VK_LSHIFT] != 0 || keyMap[VK_RSHIFT] != 0) vertical -= 1.0f;
+			if (keyMap[VK_SPACE] != 0)
+				vertical += 1.0f;
+			if (keyMap[VK_SHIFT] != 0 || keyMap[VK_LSHIFT] != 0 || keyMap[VK_RSHIFT] != 0)
+				vertical -= 1.0f;
 
-			const float yaw = (rotation->rotation.y + 90.0f) * (3.14159265358979323846f / 180.0f);
-			const float c = std::cos(yaw);
-			const float s = std::sin(yaw);
-			float wishX = (forward * c) - (strafe * s);
-			float wishZ = (forward * s) + (strafe * c);
-			const float horizontal = std::sqrt((wishX * wishX) + (wishZ * wishZ));
-			if (horizontal > 1.0f) {
-				wishX /= horizontal;
-				wishZ /= horizontal;
-			}
-
-			// Apply after MinecraftGame::_update so normal physics does not immediately
-			// overwrite the canary velocity. This remains local/offline compatibility
-			// work: no packet spoofing or server-correction bypass is performed.
+			// Leave X/Z entirely to Minecraft. The previous canary overwrote all three
+			// velocity axes every update, which fought normal movement/physics and caused
+			// visible tugging. Fly now owns Y only: Space rises, Shift descends, idle hovers.
+			// This remains local/offline compatibility work; no packet spoofing or
+			// server-correction bypass is performed.
 			constexpr float flySpeed = 0.45f;
-			state->velocity.x = wishX * flySpeed;
 			state->velocity.y = vertical * flySpeed;
-			state->velocity.z = wishZ * flySpeed;
 			++flyTicks;
 
 			if (!loggedFlyReady) {
 				loggedFlyReady = true;
-				logF("[modern] Fly runtime component bridge validated StateVector=%llX Rotation=%llX speed=%.2f",
-					reinterpret_cast<uintptr_t>(state), reinterpret_cast<uintptr_t>(rotation), flySpeed);
+				logF("[modern] Fly vertical-only bridge validated StateVector=%llX speed=%.2f nativeXZ=ON",
+					reinterpret_cast<uintptr_t>(state), flySpeed);
 			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
