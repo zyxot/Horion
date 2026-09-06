@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Modern126Overlay.h"
+#include "Modern126PresentProbe.h"
 
 // Minimal Bedrock 1.26.45.1 runtime bridge.
 //
@@ -175,9 +176,6 @@ namespace Modern126Runtime {
 		const bool debugFlush = insideDebugScreenRender && renderContext == activeDebugRenderContext;
 		const bool matchesLatestDebugContext = latestDebugRenderContext != 0 && ctx == latestDebugRenderContext;
 
-		// The previous build only logged flushes while still inside the ScreenView
-		// call. This probe logs the first calls globally so we can tell whether
-		// Bedrock flushes the same render context later in the frame.
 		if (totalTextFlushCount <= 20) {
 			logF("[modern] flushText detour #%llu ctx=%llX lastFlush=%.3f insideDebug=%s matchesDebugCtx=%s",
 				static_cast<unsigned long long>(totalTextFlushCount), ctx, lastFlush,
@@ -193,13 +191,9 @@ namespace Modern126Runtime {
 			injectingTextAtFlush = false;
 		}
 
-		// Do not call Modern126Overlay::flushTextGuarded here: that would recurse.
-		// The original Bedrock flush consumes both Minecraft's queued text and ours.
 		original(renderContext, lastFlush, optionalFlush);
 	}
 
-	// Keep SEH isolated in a trivial helper. MSVC does not allow __try in a
-	// function that also needs C++ object unwinding (such as make_unique below).
 	inline uintptr_t getTextFlushTargetGuarded(void* renderContext) {
 		if (renderContext == nullptr)
 			return 0;
@@ -238,9 +232,6 @@ namespace Modern126Runtime {
 			ensureTextFlushHook(renderContext);
 		}
 
-		// Mark only the duration of Minecraft's real debug_screen render. The
-		// flushText detour also remembers the latest debug context after this call,
-		// because current Bedrock may flush that context later in the frame.
 		const bool previousInsideDebug = insideDebugScreenRender;
 		void* previousDebugContext = activeDebugRenderContext;
 		if (debugLayerBefore) {
@@ -292,6 +283,7 @@ namespace Modern126Runtime {
 			return;
 
 		logF("[modern] Disabling 1.26 compatibility hooks");
+		Modern126PresentProbe::shutdown();
 		if (screenViewHook)
 			screenViewHook->enableHook(false);
 		if (textFlushHook)
@@ -319,6 +311,7 @@ namespace Modern126Runtime {
 					logF("[modern] CTRL+L requested unload");
 					isRunning = false;
 					break;
+				}
 			}
 			Sleep(5);
 		}
@@ -404,6 +397,8 @@ namespace Modern126Runtime {
 		screenViewHook->enableHook();
 		minecraftUpdateHook->enableHook();
 		hooksEnabled = true;
+
+		Modern126PresentProbe::start();
 
 		DWORD modernKeyThreadId = 0;
 		CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(keyThread), module, 0, &modernKeyThreadId);
