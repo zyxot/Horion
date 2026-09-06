@@ -7,6 +7,7 @@
 #include <dwrite.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
+#include <cwchar>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
@@ -15,12 +16,10 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dxgi.lib")
 
-// Current Bedrock presents through DXGI/DX12. The maintained 1.26 client also
-// renders its custom overlay from IDXGISwapChain::Present, using a D3D11On12
-// bridge plus Direct2D/DirectWrite. This implementation mirrors only that
-// renderer lifecycle: it draws a harmless diagnostic panel and text when the
-// INSERT test toggle is active. No presentation flags or gameplay state are
-// changed.
+// Stable current-Bedrock overlay path: IDXGISwapChain::Present -> D3D11On12 ->
+// Direct2D/DirectWrite. The input canary below only observes the Windows cursor
+// and left button while the test menu is visible; it does not cancel or alter
+// Minecraft input.
 namespace Modern126PresentProbe {
 	inline std::unique_ptr<FuncHook> presentHook;
 	inline std::unique_ptr<FuncHook> executeCommandListsHook;
@@ -31,7 +30,9 @@ namespace Modern126PresentProbe {
 	inline bool loggedRendererReady = false;
 	inline bool loggedFirstDraw = false;
 	inline bool loggedRendererFailure = false;
+	inline bool loggedMouseReady = false;
 	inline uint64_t presentCount = 0;
+	inline uint64_t clickCount = 0;
 	inline DWORD lastPresentLogTick = 0;
 
 	inline IDXGISwapChain3* rendererChain3 = nullptr;
@@ -50,17 +51,23 @@ namespace Modern126PresentProbe {
 	inline ID2D1SolidColorBrush* panelBrush = nullptr;
 	inline ID2D1SolidColorBrush* headerBrush = nullptr;
 	inline ID2D1SolidColorBrush* textBrush = nullptr;
+	inline ID2D1SolidColorBrush* hoverBrush = nullptr;
+	inline ID2D1SolidColorBrush* activeBrush = nullptr;
 	inline std::vector<ID3D11Resource*> wrappedTargets;
 	inline std::vector<ID2D1Bitmap1*> d2dTargets;
 	inline IDXGISwapChain* rendererChainIdentity = nullptr;
+	inline HWND rendererWindow = nullptr;
 	inline bool rendererReady = false;
+	inline POINT mouseClient = {};
+	inline bool mouseValid = false;
+	inline bool leftWasDown = false;
+	inline bool clickTestEnabled = false;
 
 	template <typename T>
 	inline void releaseCom(T*& value) {
 		if (value != nullptr) {
 			value->Release();
 			value = nullptr;
-		}
 	}
 
 	inline void releaseRenderer() {
@@ -78,6 +85,8 @@ namespace Modern126PresentProbe {
 		releaseCom(panelBrush);
 		releaseCom(headerBrush);
 		releaseCom(textBrush);
+		releaseCom(hoverBrush);
+		releaseCom(activeBrush);
 		releaseCom(titleFormat);
 		releaseCom(bodyFormat);
 		releaseCom(dwriteFactory);
@@ -92,7 +101,10 @@ namespace Modern126PresentProbe {
 		releaseCom(rendererDevice12);
 		releaseCom(rendererChain3);
 		rendererChainIdentity = nullptr;
+		rendererWindow = nullptr;
 		rendererReady = false;
+		mouseValid = false;
+		leftWasDown = false;
 		loggedRendererReady = false;
 		loggedFirstDraw = false;
 	}
@@ -195,17 +207,24 @@ namespace Modern126PresentProbe {
 		const D2D1_COLOR_F panelColor = { 0.055f, 0.065f, 0.085f, 0.94f };
 		const D2D1_COLOR_F headerColor = { 0.08f, 0.34f, 0.72f, 0.96f };
 		const D2D1_COLOR_F textColor = { 0.96f, 0.98f, 1.0f, 1.0f };
+		const D2D1_COLOR_F hoverColor = { 0.12f, 0.45f, 0.88f, 1.0f };
+		const D2D1_COLOR_F activeColor = { 0.12f, 0.62f, 0.34f, 1.0f };
 		hr = d2dContext->CreateSolidColorBrush(panelColor, &panelBrush);
 		if (FAILED(hr)) return failRenderer("panel brush", hr);
 		hr = d2dContext->CreateSolidColorBrush(headerColor, &headerBrush);
 		if (FAILED(hr)) return failRenderer("header brush", hr);
 		hr = d2dContext->CreateSolidColorBrush(textColor, &textBrush);
 		if (FAILED(hr)) return failRenderer("text brush", hr);
+		hr = d2dContext->CreateSolidColorBrush(hoverColor, &hoverBrush);
+		if (FAILED(hr)) return failRenderer("hover brush", hr);
+		hr = d2dContext->CreateSolidColorBrush(activeColor, &activeBrush);
+		if (FAILED(hr)) return failRenderer("active brush", hr);
 
 		DXGI_SWAP_CHAIN_DESC chainDesc = {};
 		hr = chain->GetDesc(&chainDesc);
 		if (FAILED(hr) || chainDesc.BufferCount == 0)
 			return failRenderer("swap-chain description", hr);
+		rendererWindow = chainDesc.OutputWindow;
 
 		wrappedTargets.reserve(chainDesc.BufferCount);
 		d2dTargets.reserve(chainDesc.BufferCount);
@@ -258,8 +277,31 @@ namespace Modern126PresentProbe {
 		loggedRendererFailure = false;
 		if (!loggedRendererReady) {
 			loggedRendererReady = true;
-			logF("[modern] Present Direct2D renderer READY chain=%llX buffers=%zu queue=%llX",
-				reinterpret_cast<uintptr_t>(chain), d2dTargets.size(), reinterpret_cast<uintptr_t>(rendererQueue));
+			logF("[modern] Present Direct2D renderer READY chain=%llX buffers=%zu queue=%llX hwnd=%llX",
+				reinterpret_cast<uintptr_t>(chain), d2dTargets.size(),
+				reinterpret_cast<uintptr_t>(rendererQueue), reinterpret_cast<uintptr_t>(rendererWindow));
+		}
+		return true;
+	}
+
+	inline bool pointInside(const POINT& point, const D2D1_RECT_F& rect) {
+		return static_cast<float>(point.x) >= rect.left && static_cast<float>(point.x) <= rect.right &&
+			static_cast<float>(point.y) >= rect.top && static_cast<float>(point.y) <= rect.bottom;
+	}
+
+	inline bool updateMouse() {
+		if (rendererWindow == nullptr)
+			return false;
+		POINT cursor = {};
+		if (!GetCursorPos(&cursor) || !ScreenToClient(rendererWindow, &cursor)) {
+			mouseValid = false;
+			return false;
+		}
+		mouseClient = cursor;
+		mouseValid = true;
+		if (!loggedMouseReady) {
+			loggedMouseReady = true;
+			logF("[modern] Present mouse observation active; clicks are not intercepted");
 		}
 		return true;
 	}
@@ -279,29 +321,69 @@ namespace Modern126PresentProbe {
 			return;
 		}
 
+		updateMouse();
+		const D2D1_RECT_F buttonRect = { 38.0f, 185.0f, 272.0f, 226.0f };
+		const bool hovered = mouseValid && pointInside(mouseClient, buttonRect);
+		const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		if (hovered && leftDown && !leftWasDown) {
+			clickTestEnabled = !clickTestEnabled;
+			++clickCount;
+			logF("[modern] Present input canary click #%llu x=%ld y=%ld state=%s",
+				static_cast<unsigned long long>(clickCount), mouseClient.x, mouseClient.y,
+				clickTestEnabled ? "ON" : "OFF");
+		}
+		leftWasDown = leftDown;
+
 		ID3D11Resource* wrapped = wrappedTargets[index];
 		bridge11On12->AcquireWrappedResources(&wrapped, 1);
 		d2dContext->SetTarget(d2dTargets[index]);
 		d2dContext->BeginDraw();
 
-		const D2D1_RECT_F panel = { 24.0f, 24.0f, 414.0f, 196.0f };
-		const D2D1_RECT_F header = { 24.0f, 24.0f, 414.0f, 62.0f };
+		const D2D1_RECT_F panel = { 24.0f, 24.0f, 454.0f, 250.0f };
+		const D2D1_RECT_F header = { 24.0f, 24.0f, 454.0f, 62.0f };
 		d2dContext->FillRectangle(panel, panelBrush);
 		d2dContext->FillRectangle(header, headerBrush);
 
-		static const wchar_t title[] = L"HORION PRESENT RENDERER TEST";
-		static const wchar_t line1[] = L"Direct2D + DirectWrite on the DXGI backbuffer";
-		static const wchar_t line2[] = L"This should stay visible every frame";
-		static const wchar_t line3[] = L"INSERT toggles this panel";
-		const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 404.0f, 59.0f };
-		const D2D1_RECT_F line1Rect = { 38.0f, 79.0f, 404.0f, 108.0f };
-		const D2D1_RECT_F line2Rect = { 38.0f, 119.0f, 404.0f, 148.0f };
-		const D2D1_RECT_F line3Rect = { 38.0f, 159.0f, 404.0f, 188.0f };
-
+		static const wchar_t title[] = L"HORION 1.26 UI BRIDGE";
+		static const wchar_t line1[] = L"Stable Present renderer: Direct2D + DirectWrite";
+		static const wchar_t line2[] = L"Mouse canary: move over the button and click";
+		const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 444.0f, 59.0f };
+		const D2D1_RECT_F line1Rect = { 38.0f, 79.0f, 444.0f, 108.0f };
+		const D2D1_RECT_F line2Rect = { 38.0f, 116.0f, 444.0f, 145.0f };
 		d2dContext->DrawText(title, _countof(title) - 1, titleFormat, titleRect, textBrush);
 		d2dContext->DrawText(line1, _countof(line1) - 1, bodyFormat, line1Rect, textBrush);
 		d2dContext->DrawText(line2, _countof(line2) - 1, bodyFormat, line2Rect, textBrush);
-		d2dContext->DrawText(line3, _countof(line3) - 1, bodyFormat, line3Rect, textBrush);
+
+		wchar_t mouseStatus[128] = {};
+		if (mouseValid) {
+			swprintf_s(mouseStatus, _countof(mouseStatus), L"Mouse: %ld, %ld   Click test: %s",
+				mouseClient.x, mouseClient.y, clickTestEnabled ? L"ON" : L"OFF");
+		} else {
+			wcscpy_s(mouseStatus, L"Mouse: unavailable");
+		}
+		const D2D1_RECT_F mouseRect = { 38.0f, 151.0f, 444.0f, 179.0f };
+		d2dContext->DrawText(mouseStatus, static_cast<UINT32>(wcslen(mouseStatus)), bodyFormat, mouseRect, textBrush);
+
+		ID2D1SolidColorBrush* buttonBrush = clickTestEnabled ? activeBrush : (hovered ? hoverBrush : headerBrush);
+		d2dContext->FillRectangle(buttonRect, buttonBrush);
+		static const wchar_t buttonOff[] = L"CLICK TEST: OFF";
+		static const wchar_t buttonOn[] = L"CLICK TEST: ON";
+		const wchar_t* buttonText = clickTestEnabled ? buttonOn : buttonOff;
+		const UINT32 buttonLength = clickTestEnabled ? _countof(buttonOn) - 1 : _countof(buttonOff) - 1;
+		const D2D1_RECT_F buttonTextRect = { 50.0f, 193.0f, 264.0f, 222.0f };
+		d2dContext->DrawText(buttonText, buttonLength, bodyFormat, buttonTextRect, textBrush);
+
+		if (mouseValid) {
+			const D2D1_RECT_F marker = {
+				static_cast<float>(mouseClient.x) - 3.0f, static_cast<float>(mouseClient.y) - 3.0f,
+				static_cast<float>(mouseClient.x) + 3.0f, static_cast<float>(mouseClient.y) + 3.0f
+			};
+			d2dContext->FillRectangle(marker, textBrush);
+		}
+
+		static const wchar_t footer[] = L"INSERT closes menu   |   CTRL+L unloads";
+		const D2D1_RECT_F footerRect = { 290.0f, 195.0f, 446.0f, 240.0f };
+		d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
 
 		const HRESULT drawHr = d2dContext->EndDraw();
 		bridge11On12->ReleaseWrappedResources(&wrapped, 1);
@@ -316,7 +398,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D text panel rendered successfully");
+			logF("[modern] Present Direct2D UI + mouse canary rendered successfully");
 		}
 	}
 
@@ -328,7 +410,7 @@ namespace Modern126PresentProbe {
 
 		const DWORD now = GetTickCount();
 		if (!loggedPresent || presentCount <= 3 ||
-			(Modern126Overlay::visible && (now - lastPresentLogTick) >= 1000)) {
+			(Modern126Overlay::visible && (now - lastPresentLogTick) >= 2000)) {
 			ID3D12Device* device12 = nullptr;
 			ID3D11Device* device11 = nullptr;
 			const HRESULT hr12 = chain != nullptr ? chain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device12)) : E_POINTER;
