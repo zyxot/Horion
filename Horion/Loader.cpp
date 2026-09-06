@@ -1,5 +1,6 @@
 #include "Loader.h"
 #include "Modern126Runtime.h"
+#include "Modern126Gameplay.h"
 
 SlimUtils::SlimMem mem;
 const SlimUtils::SlimModule* gameModule;
@@ -43,6 +44,7 @@ DWORD WINAPI start(LPVOID lpParam) {
 	}
 
 	if (Modern126Runtime::tryStart(static_cast<HMODULE>(lpParam))) {
+		Modern126Gameplay::start(Modern126Runtime::clientInstance, Modern126Runtime::keyMap);
 		logF("[modern] 1.26 runtime core is ACTIVE");
 		logF("[modern] Waiting for render/update callbacks; CTRL+L unloads the DLL");
 		ExitThread(0);
@@ -68,6 +70,7 @@ BOOL __stdcall DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
 		isRunning = false;
 
 		if (Modern126Runtime::isSelected()) {
+			Modern126Gameplay::shutdown();
 			Modern126Runtime::shutdownHooks();
 			logF("[modern] Runtime bridge detached");
 			Logger::Disable();
