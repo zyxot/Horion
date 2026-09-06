@@ -23,6 +23,25 @@ namespace Modern126Runtime {
 	inline std::unique_ptr<FuncHook> minecraftUpdateHook;
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
+	inline bool loggedRenderCanary = false;
+	inline bool renderCanaryFailed = false;
+
+	// Current MinecraftUIRenderContext uses these simple POD layouts. Keeping
+	// them local to the compatibility bridge avoids pulling the archived 1.18
+	// rendering SDK into the first live 1.26 render test.
+	struct ModernRectangleArea {
+		float left;
+		float right;
+		float top;
+		float bottom;
+	};
+
+	struct ModernColor {
+		float r;
+		float g;
+		float b;
+		float a;
+	};
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -42,6 +61,38 @@ namespace Modern126Runtime {
 		const SIZE_T queried = VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info));
 		return queried == sizeof(info) && info.Type == MEM_IMAGE &&
 			info.AllocationBase == GetModuleHandleA("Minecraft.Windows.exe");
+	}
+
+	inline void drawRenderCanary(void* renderContext) {
+		if (renderContext == nullptr || renderCanaryFailed)
+			return;
+
+		// 1.26 MinecraftUIRenderContext slot 0xF is fillRectangle. Use only POD
+		// arguments and guard the call with SEH so a future game update cannot turn
+		// this visual probe into another startup crash.
+		__try {
+			auto* renderVtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			if (renderVtable == nullptr || !addressInMinecraft(renderVtable[0xF])) {
+				renderCanaryFailed = true;
+				logF("[modern] Render canary disabled: MinecraftUIRenderContext slot 0xF is invalid");
+				return;
+			}
+
+			const ModernRectangleArea rect { 8.f, 168.f, 8.f, 30.f };
+			const ModernColor color { 0.10f, 0.65f, 1.00f, 0.85f };
+			using FillRectangleFn = void(__fastcall*)(void*, const ModernRectangleArea&, const ModernColor&, float);
+			auto fillRectangle = reinterpret_cast<FillRectangleFn>(renderVtable[0xF]);
+			fillRectangle(renderContext, rect, color, 1.0f);
+
+			if (!loggedRenderCanary) {
+				loggedRenderCanary = true;
+				logF("[modern] 1.26 fillRectangle render canary executed successfully");
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			renderCanaryFailed = true;
+			logF("[modern] Render canary trapped SEH exception 0x%08X and was disabled", GetExceptionCode());
+		}
 	}
 
 	inline C_LocalPlayer* refreshLocalPlayer() {
@@ -76,6 +127,7 @@ namespace Modern126Runtime {
 	inline void __fastcall screenViewDetour(void* view, void* renderContext) {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
 		original(view, renderContext);
+		drawRenderCanary(renderContext);
 		refreshLocalPlayer();
 		g_Data.frameCount++;
 		if (!loggedScreenHook) {
