@@ -23,11 +23,14 @@ namespace Modern126Runtime {
 	inline std::unique_ptr<FuncHook> grabCursorHook;
 	inline uintptr_t releaseCursorTarget = 0;
 	inline bool cursorReleasedForOverlay = false;
+	inline bool rawCursorOverrideActive = false;
+	inline bool rawCursorPreviousGrabbed = true;
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
 	inline bool loggedDebugScreenLayer = false;
 	inline bool loggedCursorBridge = false;
 	inline bool loggedCursorUnavailable = false;
+	inline bool loggedRawCursorFallback = false;
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -101,47 +104,108 @@ namespace Modern126Runtime {
 		original(instance);
 	}
 
-	inline void restoreGameplayCursor() {
-		if (!cursorReleasedForOverlay)
-			return;
-
-		// Only re-grab in an active gameplay session. If the player disappeared
-		// (for example, returning to the title screen), leave cursor ownership to
-		// Minecraft instead of calling gameplay cursor code on stale state.
-		if (clientInstance != nullptr && localPlayer != nullptr && grabCursorHook) {
-			auto originalGrab = grabCursorHook->GetFastcall<void, void*>();
-			originalGrab(clientInstance);
-			logF("[modern] Gameplay cursor restored to Minecraft");
+	// The maintained current client keeps MinecraftGame::mouseGrabbed at +0x1D8.
+	// These helpers are intentionally tiny POD/SEH functions so a bad read/write
+	// fails closed instead of taking down the already-working renderer.
+	inline bool readRawCursorGrabbed(bool* outValue) {
+		if (outValue == nullptr || minecraftGame == nullptr)
+			return false;
+		__try {
+			*outValue = *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x1D8);
+			return true;
 		}
-		cursorReleasedForOverlay = false;
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	inline bool writeRawCursorGrabbed(bool value) {
+		if (minecraftGame == nullptr)
+			return false;
+		__try {
+			*reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x1D8) = value;
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	inline void exposeWindowsCursor() {
+		ClipCursor(nullptr);
+		ReleaseCapture();
+		SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+	}
+
+	inline void restoreGameplayCursor() {
+		if (rawCursorOverrideActive) {
+			writeRawCursorGrabbed(rawCursorPreviousGrabbed);
+			rawCursorOverrideActive = false;
+			if (rawCursorPreviousGrabbed)
+				SetCursor(nullptr);
+			logF("[modern] Raw gameplay cursor state restored=%s", rawCursorPreviousGrabbed ? "GRABBED" : "FREE");
+		}
+
+		if (cursorReleasedForOverlay) {
+			// Only re-grab in an active gameplay session. If the player disappeared
+			// (for example, returning to the title screen), leave cursor ownership to
+			// Minecraft instead of calling gameplay cursor code on stale state.
+			if (clientInstance != nullptr && localPlayer != nullptr && grabCursorHook) {
+				auto originalGrab = grabCursorHook->GetFastcall<void, void*>();
+				originalGrab(clientInstance);
+				logF("[modern] Gameplay cursor restored to Minecraft");
+			}
+			cursorReleasedForOverlay = false;
+		}
 	}
 
 	inline void syncCursorForOverlay() {
-		if (!grabCursorHook || releaseCursorTarget == 0 || clientInstance == nullptr) {
-			if (!Modern126Overlay::visible && cursorReleasedForOverlay)
-				cursorReleasedForOverlay = false;
+		if (!Modern126Overlay::visible) {
+			restoreGameplayCursor();
 			return;
 		}
 
-		if (Modern126Overlay::visible) {
-			if (localPlayer == nullptr) {
-				cursorReleasedForOverlay = false;
-				return;
-			}
+		if (clientInstance == nullptr || localPlayer == nullptr || minecraftGame == nullptr)
+			return;
 
+		if (grabCursorHook && releaseCursorTarget != 0) {
 			if (!cursorReleasedForOverlay) {
 				using ReleaseCursorFn = void(__fastcall*)(void*);
 				auto releaseCursor = reinterpret_cast<ReleaseCursorFn>(releaseCursorTarget);
 				releaseCursor(clientInstance);
-				ClipCursor(nullptr);
-				SetCursor(LoadCursorW(nullptr, IDC_ARROW));
 				cursorReleasedForOverlay = true;
-				logF("[modern] Gameplay cursor released for Horion UI");
+				logF("[modern] Gameplay cursor released for Horion UI through ClientInstance");
 			}
+			exposeWindowsCursor();
 			return;
 		}
 
-		restoreGameplayCursor();
+		// Exact 1.26.45.1 can fail the maintained grab/release signatures even
+		// though the MinecraftGame object layout is already validated. In that
+		// case, use the current mouseGrabbed field as a narrow compatibility fallback.
+		if (!rawCursorOverrideActive) {
+			bool previous = true;
+			if (!readRawCursorGrabbed(&previous)) {
+				if (!loggedCursorUnavailable) {
+					loggedCursorUnavailable = true;
+					logF("[modern] Raw gameplay cursor fallback failed to read MinecraftGame+0x1D8");
+				}
+				return;
+			}
+			rawCursorPreviousGrabbed = previous;
+			rawCursorOverrideActive = true;
+			if (!loggedRawCursorFallback) {
+				loggedRawCursorFallback = true;
+				logF("[modern] Raw gameplay cursor fallback ACTIVE; previous=%s", previous ? "GRABBED" : "FREE");
+			}
+		}
+
+		if (!writeRawCursorGrabbed(false)) {
+			logF("[modern] Raw gameplay cursor fallback write failed; restoring state");
+			restoreGameplayCursor();
+			return;
+		}
+		exposeWindowsCursor();
 	}
 
 	inline void __fastcall minecraftUpdateDetour(void* game) {
@@ -182,7 +246,6 @@ namespace Modern126Runtime {
 
 		logF("[modern] Disabling 1.26 compatibility hooks");
 
-		// Restore normal gameplay cursor ownership before removing the grab hook.
 		restoreGameplayCursor();
 		if (grabCursorHook)
 			grabCursorHook->enableHook(false);
@@ -301,8 +364,9 @@ namespace Modern126Runtime {
 		minecraftUpdateHook->enableHook();
 		hooksEnabled = true;
 
-		// Cursor lifecycle support is deliberately optional: failure to resolve it
-		// must never take down the already-validated renderer/runtime bridge.
+		// Cursor lifecycle support is optional. The current maintained signatures
+		// are attempted first, but exact 1.26.45.1 builds can differ. If they do,
+		// the raw MinecraftGame +0x1D8 compatibility path remains available.
 		const uintptr_t grabCursorTarget = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 48 83 EC");
 		const uintptr_t releaseCursorCandidate = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 53");
 		if (addressInMinecraft(grabCursorTarget) && addressInMinecraft(releaseCursorCandidate) &&
@@ -313,9 +377,15 @@ namespace Modern126Runtime {
 			loggedCursorBridge = true;
 			logF("[modern] Gameplay cursor bridge installed grab=%llX release=%llX",
 				grabCursorTarget, releaseCursorTarget);
-		} else if (!loggedCursorUnavailable) {
-			loggedCursorUnavailable = true;
-			logF("[modern] Gameplay cursor bridge unavailable; INSERT UI remains render-only");
+		} else {
+			bool initialGrabbed = false;
+			if (readRawCursorGrabbed(&initialGrabbed)) {
+				logF("[modern] Gameplay cursor signatures unavailable; raw MinecraftGame+0x1D8 fallback armed initial=%s",
+					initialGrabbed ? "GRABBED" : "FREE");
+			} else if (!loggedCursorUnavailable) {
+				loggedCursorUnavailable = true;
+				logF("[modern] Gameplay cursor control unavailable; overlay remains render-only");
+			}
 		}
 
 		Modern126PresentProbe::start();
