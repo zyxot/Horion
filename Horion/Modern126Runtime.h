@@ -7,9 +7,9 @@
 // This deliberately does NOT enable Horion's archived 1.18 hook table. The
 // old hook initializer dereferences stale signatures and is the reason the
 // unmodified client crashes on current Minecraft. Instead we first keep the
-// DLL alive with two current, pass-through hooks and the current KeyMap. Once
-// this bridge is proven stable, the old Horion systems can be ported onto it
-// one subsystem at a time.
+// DLL alive with current, pass-through hooks and the current KeyMap. Once this
+// bridge is proven stable, the old Horion systems can be ported onto it one
+// subsystem at a time.
 namespace Modern126Runtime {
 	inline bool modeSelected = false;
 	inline bool hooksEnabled = false;
@@ -23,14 +23,20 @@ namespace Modern126Runtime {
 	inline HMODULE dllModule = nullptr;
 	inline std::unique_ptr<FuncHook> screenViewHook;
 	inline std::unique_ptr<FuncHook> minecraftUpdateHook;
+	inline std::unique_ptr<FuncHook> textFlushHook;
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
 	inline bool loggedDebugScreenLayer = false;
-	inline bool loggedDeferredText = false;
-	inline bool loggedDeferredTextFailure = false;
+	inline bool loggedTextFlushHook = false;
+	inline bool loggedFlushTextInjection = false;
+	inline bool loggedFlushTextFailure = false;
 	inline uint64_t debugOverlayPassCount = 0;
+	inline uint64_t debugTextFlushCount = 0;
 	inline DWORD lastDebugOverlayLogTick = 0;
 	inline uintptr_t lastDebugOverlayContext = 0;
+	inline thread_local bool insideDebugScreenRender = false;
+	inline thread_local bool injectingTextAtFlush = false;
+	inline thread_local void* activeDebugRenderContext = nullptr;
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -106,11 +112,7 @@ namespace Modern126Runtime {
 		}
 	}
 
-	// Diagnostic: queue our text before Minecraft renders the debug_screen and do
-	// NOT call flushText ourselves. If this remains visible, the previous flash was
-	// caused by submitting text after Minecraft's normal text-flush lifecycle had
-	// already completed for the layer.
-	inline bool queueTextBeforeMinecraftFlush(void* renderContext) {
+	inline bool queueTextImmediatelyBeforeFlush(void* renderContext) {
 		if (!Modern126Overlay::visible || renderContext == nullptr)
 			return false;
 
@@ -125,9 +127,9 @@ namespace Modern126Runtime {
 		bool usedDefaultFont = false;
 		void* font = Modern126Overlay::resolveFontGuarded(minecraftGame, &fontId, &fontCount, &usedDefaultFont);
 		if (font == nullptr) {
-			if (!loggedDeferredTextFailure) {
-				loggedDeferredTextFailure = true;
-				logF("[modern] Pre-ScreenView deferred text failed: FontRepository font could not be resolved");
+			if (!loggedFlushTextFailure) {
+				loggedFlushTextFailure = true;
+				logF("[modern] flushText-hook text failed: FontRepository font could not be resolved");
 			}
 			return false;
 		}
@@ -139,9 +141,9 @@ namespace Modern126Runtime {
 		const Modern126Overlay::Color text { 0.95f, 0.97f, 1.00f, 1.00f };
 		const Modern126Overlay::Color muted { 0.70f, 0.76f, 0.84f, 1.00f };
 
-		static const std::string title = "HORION PRE-FLUSH TEXT TEST";
-		static const std::string line1 = "Queued before ScreenView render";
-		static const std::string line2 = "Minecraft owns the text flush";
+		static const std::string title = "HORION FLUSHTEXT HOOK TEST";
+		static const std::string line1 = "Injected inside Bedrock text flush";
+		static const std::string line2 = "Same frame, same render context";
 		static const std::string line3 = "INSERT closes this test";
 
 		const bool ok =
@@ -150,29 +152,101 @@ namespace Modern126Runtime {
 			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 122.f, 156.f), line2, text, 30.f, scale, lineHeight) &&
 			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 166.f, 200.f), line3, muted, 30.f, scale, lineHeight);
 
-		if (ok && !loggedDeferredText) {
-			loggedDeferredText = true;
-			logF("[modern] Pre-ScreenView text queued successfully; no Horion flushText call was made");
-			logF("[modern] Deferred font=%llX id=%llu count=%zu lineHeight=%.3f",
+		if (ok && !loggedFlushTextInjection) {
+			loggedFlushTextInjection = true;
+			logF("[modern] Horion text injected immediately before Minecraft flushText");
+			logF("[modern] flushText-hook font=%llX id=%llu count=%zu lineHeight=%.3f",
 				reinterpret_cast<uintptr_t>(font), static_cast<unsigned long long>(fontId), fontCount, lineHeight);
 		}
-		if (!ok && !loggedDeferredTextFailure) {
-			loggedDeferredTextFailure = true;
-			logF("[modern] Pre-ScreenView deferred drawText call failed");
+		if (!ok && !loggedFlushTextFailure) {
+			loggedFlushTextFailure = true;
+			logF("[modern] flushText-hook drawText call failed");
 		}
 		return ok;
 	}
 
+	inline void __fastcall flushTextDetour(void* renderContext, float lastFlush, std::optional<float> optionalFlush) {
+		auto original = textFlushHook->GetFastcall<void, void*, float, std::optional<float>>();
+
+		const bool debugFlush = insideDebugScreenRender && renderContext == activeDebugRenderContext;
+		if (debugFlush) {
+			++debugTextFlushCount;
+			if (debugTextFlushCount <= 12) {
+				if (optionalFlush.has_value()) {
+					logF("[modern] debug_screen flushText #%llu ctx=%llX lastFlush=%.3f optional=%.3f",
+						static_cast<unsigned long long>(debugTextFlushCount),
+						reinterpret_cast<uintptr_t>(renderContext), lastFlush, optionalFlush.value());
+				} else {
+					logF("[modern] debug_screen flushText #%llu ctx=%llX lastFlush=%.3f optional=none",
+						static_cast<unsigned long long>(debugTextFlushCount),
+						reinterpret_cast<uintptr_t>(renderContext), lastFlush);
+				}
+			}
+
+			if (Modern126Overlay::visible && !injectingTextAtFlush) {
+				injectingTextAtFlush = true;
+				queueTextImmediatelyBeforeFlush(renderContext);
+				injectingTextAtFlush = false;
+			}
+		}
+
+		// Do not call Modern126Overlay::flushTextGuarded here: that would recurse.
+		// The original Bedrock flush consumes both Minecraft's queued text and ours.
+		original(renderContext, lastFlush, optionalFlush);
+	}
+
+	inline bool ensureTextFlushHook(void* renderContext) {
+		if (textFlushHook)
+			return true;
+		if (renderContext == nullptr)
+			return false;
+
+		uintptr_t target = 0;
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			if (vtable == nullptr)
+				return false;
+			target = vtable[0x6];
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+
+		if (!addressInMinecraft(target))
+			return false;
+
+		textFlushHook = std::make_unique<FuncHook>(target, reinterpret_cast<void*>(flushTextDetour));
+		textFlushHook->enableHook();
+		if (!loggedTextFlushHook) {
+			loggedTextFlushHook = true;
+			logF("[modern] MinecraftUIRenderContext::flushText hook installed target=%llX", target);
+		}
+		return true;
+	}
+
 	inline void __fastcall screenViewDetour(void* view, void* renderContext) {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
-
-		// Queue text while Minecraft still owns this layer's normal render lifecycle.
-		// We deliberately let the original ScreenView call perform any text flush.
 		const bool debugLayerBefore = isDebugScreenView(view);
-		if (debugLayerBefore && Modern126Overlay::visible)
-			queueTextBeforeMinecraftFlush(renderContext);
+
+		if (debugLayerBefore)
+			ensureTextFlushHook(renderContext);
+
+		// Mark only the duration of Minecraft's real debug_screen render. The
+		// flushText detour uses this to inject at the exact point Bedrock consumes
+		// its text batch, rather than before or after the layer lifecycle.
+		const bool previousInsideDebug = insideDebugScreenRender;
+		void* previousDebugContext = activeDebugRenderContext;
+		if (debugLayerBefore) {
+			insideDebugScreenRender = true;
+			activeDebugRenderContext = renderContext;
+		}
 
 		original(view, renderContext);
+
+		if (debugLayerBefore) {
+			insideDebugScreenRender = previousInsideDebug;
+			activeDebugRenderContext = previousDebugContext;
+		}
 
 		const bool debugLayer = isDebugScreenView(view);
 		if (debugLayer) {
@@ -187,7 +261,7 @@ namespace Modern126Runtime {
 				const uintptr_t ctx = reinterpret_cast<uintptr_t>(renderContext);
 				const bool contextChanged = ctx != lastDebugOverlayContext;
 				if (debugOverlayPassCount <= 12 || contextChanged || (now - lastDebugOverlayLogTick) >= 1000) {
-					logF("[modern] debug_screen pre-flush overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
+					logF("[modern] debug_screen flush-hook overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
 						static_cast<unsigned long long>(debugOverlayPassCount),
 						reinterpret_cast<uintptr_t>(view), ctx, contextChanged ? "YES" : "NO");
 					lastDebugOverlayLogTick = now;
@@ -213,9 +287,12 @@ namespace Modern126Runtime {
 		logF("[modern] Disabling 1.26 compatibility hooks");
 		if (screenViewHook)
 			screenViewHook->enableHook(false);
+		if (textFlushHook)
+			textFlushHook->enableHook(false);
 		if (minecraftUpdateHook)
 			minecraftUpdateHook->enableHook(false);
 		screenViewHook.reset();
+		textFlushHook.reset();
 		minecraftUpdateHook.reset();
 		hooksEnabled = false;
 	}
