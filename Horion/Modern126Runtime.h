@@ -25,6 +25,7 @@ namespace Modern126Runtime {
 	inline std::unique_ptr<FuncHook> minecraftUpdateHook;
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
+	inline bool loggedDebugScreenLayer = false;
 
 	inline uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
 		if (instruction == 0)
@@ -44,6 +45,33 @@ namespace Modern126Runtime {
 		const SIZE_T queried = VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info));
 		return queried == sizeof(info) && info.Type == MEM_IMAGE &&
 			info.AllocationBase == GetModuleHandleA("Minecraft.Windows.exe");
+	}
+
+	// ScreenView::setupAndRender is invoked for multiple UI layers. The maintained
+	// current client renders Minecraft-backed HUD/UI content specifically on the
+	// "debug_screen" VisualTree layer. Drawing our panel on every ScreenView pass
+	// caused later layer passes to redraw the rectangles after an earlier text
+	// flush, which matches the observed one-frame text flash.
+	inline bool isDebugScreenViewUnsafe(void* view) {
+		if (view == nullptr)
+			return false;
+		void* visualTree = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(view) + 0x48);
+		if (visualTree == nullptr)
+			return false;
+		void* rootControl = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(visualTree) + 0x8);
+		if (rootControl == nullptr)
+			return false;
+		auto* name = reinterpret_cast<std::string*>(reinterpret_cast<uintptr_t>(rootControl) + 0x20);
+		return *name == "debug_screen";
+	}
+
+	inline bool isDebugScreenView(void* view) {
+		__try {
+			return isDebugScreenViewUnsafe(view);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
 	}
 
 	inline C_LocalPlayer* refreshLocalPlayer() {
@@ -78,7 +106,16 @@ namespace Modern126Runtime {
 	inline void __fastcall screenViewDetour(void* view, void* renderContext) {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
 		original(view, renderContext);
-		Modern126Overlay::render(renderContext, guiData, minecraftGame);
+
+		const bool debugLayer = isDebugScreenView(view);
+		if (debugLayer) {
+			if (!loggedDebugScreenLayer) {
+				loggedDebugScreenLayer = true;
+				logF("[modern] debug_screen UI layer selected for overlay rendering");
+			}
+			Modern126Overlay::render(renderContext, guiData, minecraftGame);
+		}
+
 		refreshLocalPlayer();
 		g_Data.frameCount++;
 		if (!loggedScreenHook) {
