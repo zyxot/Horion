@@ -26,6 +26,8 @@ namespace Modern126Runtime {
 	inline bool loggedScreenHook = false;
 	inline bool loggedUpdateHook = false;
 	inline bool loggedDebugScreenLayer = false;
+	inline bool loggedDeferredText = false;
+	inline bool loggedDeferredTextFailure = false;
 	inline uint64_t debugOverlayPassCount = 0;
 	inline DWORD lastDebugOverlayLogTick = 0;
 	inline uintptr_t lastDebugOverlayContext = 0;
@@ -104,8 +106,72 @@ namespace Modern126Runtime {
 		}
 	}
 
+	// Diagnostic: queue our text before Minecraft renders the debug_screen and do
+	// NOT call flushText ourselves. If this remains visible, the previous flash was
+	// caused by submitting text after Minecraft's normal text-flush lifecycle had
+	// already completed for the layer.
+	inline bool queueTextBeforeMinecraftFlush(void* renderContext) {
+		if (!Modern126Overlay::visible || renderContext == nullptr)
+			return false;
+
+		const float scale = Modern126Overlay::getGuiScaleFracGuarded(guiData);
+		if (!Modern126Overlay::loggedGuiScale) {
+			Modern126Overlay::loggedGuiScale = true;
+			logF("[modern] Overlay GuiData scale fraction=%.3f", scale);
+		}
+
+		uint64_t fontId = UINT64_MAX;
+		size_t fontCount = 0;
+		bool usedDefaultFont = false;
+		void* font = Modern126Overlay::resolveFontGuarded(minecraftGame, &fontId, &fontCount, &usedDefaultFont);
+		if (font == nullptr) {
+			if (!loggedDeferredTextFailure) {
+				loggedDeferredTextFailure = true;
+				logF("[modern] Pre-ScreenView deferred text failed: FontRepository font could not be resolved");
+			}
+			return false;
+		}
+
+		const float lineHeight = Modern126Overlay::getFontLineHeightGuarded(font);
+		const auto scaledRect = [scale](float left, float right, float top, float bottom) {
+			return Modern126Overlay::RectangleArea { left * scale, right * scale, top * scale, bottom * scale };
+		};
+		const Modern126Overlay::Color text { 0.95f, 0.97f, 1.00f, 1.00f };
+		const Modern126Overlay::Color muted { 0.70f, 0.76f, 0.84f, 1.00f };
+
+		static const std::string title = "HORION PRE-FLUSH TEXT TEST";
+		static const std::string line1 = "Queued before ScreenView render";
+		static const std::string line2 = "Minecraft owns the text flush";
+		static const std::string line3 = "INSERT closes this test";
+
+		const bool ok =
+			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(30.f, 318.f, 24.f, 58.f), title, text, 32.f, scale, lineHeight) &&
+			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 78.f, 112.f), line1, text, 30.f, scale, lineHeight) &&
+			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 122.f, 156.f), line2, text, 30.f, scale, lineHeight) &&
+			Modern126Overlay::drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 166.f, 200.f), line3, muted, 30.f, scale, lineHeight);
+
+		if (ok && !loggedDeferredText) {
+			loggedDeferredText = true;
+			logF("[modern] Pre-ScreenView text queued successfully; no Horion flushText call was made");
+			logF("[modern] Deferred font=%llX id=%llu count=%zu lineHeight=%.3f",
+				reinterpret_cast<uintptr_t>(font), static_cast<unsigned long long>(fontId), fontCount, lineHeight);
+		}
+		if (!ok && !loggedDeferredTextFailure) {
+			loggedDeferredTextFailure = true;
+			logF("[modern] Pre-ScreenView deferred drawText call failed");
+		}
+		return ok;
+	}
+
 	inline void __fastcall screenViewDetour(void* view, void* renderContext) {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
+
+		// Queue text while Minecraft still owns this layer's normal render lifecycle.
+		// We deliberately let the original ScreenView call perform any text flush.
+		const bool debugLayerBefore = isDebugScreenView(view);
+		if (debugLayerBefore && Modern126Overlay::visible)
+			queueTextBeforeMinecraftFlush(renderContext);
+
 		original(view, renderContext);
 
 		const bool debugLayer = isDebugScreenView(view);
@@ -121,15 +187,13 @@ namespace Modern126Runtime {
 				const uintptr_t ctx = reinterpret_cast<uintptr_t>(renderContext);
 				const bool contextChanged = ctx != lastDebugOverlayContext;
 				if (debugOverlayPassCount <= 12 || contextChanged || (now - lastDebugOverlayLogTick) >= 1000) {
-					logF("[modern] debug_screen overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
+					logF("[modern] debug_screen pre-flush overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
 						static_cast<unsigned long long>(debugOverlayPassCount),
 						reinterpret_cast<uintptr_t>(view), ctx, contextChanged ? "YES" : "NO");
 					lastDebugOverlayLogTick = now;
 				}
 				lastDebugOverlayContext = ctx;
 			}
-
-			Modern126Overlay::render(renderContext, guiData, minecraftGame);
 		}
 
 		refreshLocalPlayer();
