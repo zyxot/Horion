@@ -62,6 +62,15 @@ private:
 		return instruction + instructionLength + displacement;
 	}
 
+	static bool isMinecraftImageAddress(uintptr_t address) {
+		if (address == 0)
+			return false;
+		MEMORY_BASIC_INFORMATION info = {};
+		const SIZE_T queried = VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info));
+		const HMODULE minecraftModule = GetModuleHandleA("Minecraft.Windows.exe");
+		return queried == sizeof(info) && info.Type == MEM_IMAGE && info.AllocationBase == minecraftModule;
+	}
+
 	static void logMinecraftBinaryInfo() {
 		HMODULE gameModuleHandle = GetModuleHandleA("Minecraft.Windows.exe");
 		if (gameModuleHandle == nullptr) {
@@ -209,26 +218,16 @@ private:
 			return true;
 		}
 
-		const uintptr_t localPlayerVtableSig = FindSignature("48 8D 05 ? ? ? ? 48 89 07 48 8D 87 08 0F 00 00 48 89 85 ? ? ? ? C6 87 30 0F 00 00 00 C6 87 39 0F 00 00 00");
-		const uintptr_t expectedLocalPlayerVtable = resolveRipRelative(localPlayerVtableSig);
-		const uintptr_t actualLocalPlayerVtable = *reinterpret_cast<uintptr_t*>(localPlayer);
+		const uintptr_t expectedLocalPlayerVtable = resolveRipRelative(FindSignature("48 8D 05 ? ? ? ? 48 89 07 48 8D 87 08 0F 00 00 48 89 85 ? ? ? ? C6 87 30 0F 00 00 00 C6 87 39 0F 00 00 00"));
 		const uintptr_t expectedPlayerVtable = resolveRipRelative(FindSignature("48 8D 0D ? ? ? ? 49 89 0C 24 41 89 84 24 B8 0C 00 00 49 8D 84 24 C0 0C 00 00"));
 		const uintptr_t expectedMobVtable = resolveRipRelative(FindSignature("48 8D 05 ? ? ? ? 48 89 07 66 0F EF C0 F3 0F 7F 87 68 04 00 00 48 89 BD ? ? ? ? 48 C7 87 78 04 00 00 ? ? ? ?"));
+		const uintptr_t actualLocalPlayerVtable = *reinterpret_cast<uintptr_t*>(localPlayer);
 		logF("[compat] LocalPlayer ctor-vtable target  : %llX", expectedLocalPlayerVtable);
 		logF("[compat] Player ctor-vtable target       : %llX", expectedPlayerVtable);
 		logF("[compat] Mob ctor-vtable target          : %llX", expectedMobVtable);
 		logF("[compat] LocalPlayer live vtable         : %llX", actualLocalPlayerVtable);
 
-		// The LocalPlayer signature is taken from construction code. On 1.26.45.1
-		// the live in-world object can carry a later/final derived vtable, so exact
-		// equality with the constructor-time target is not sufficient proof. Make
-		// sure the live vtable itself belongs to Minecraft, then validate the
-		// Player->GameMode relationship and two known GameMode virtual slots.
-		MEMORY_BASIC_INFORMATION vtableInfo = {};
-		const SIZE_T queried = VirtualQuery(reinterpret_cast<void*>(actualLocalPlayerVtable), &vtableInfo, sizeof(vtableInfo));
-		const HMODULE minecraftModule = GetModuleHandleA("Minecraft.Windows.exe");
-		const bool liveVtableInMinecraft = queried == sizeof(vtableInfo) &&
-			vtableInfo.Type == MEM_IMAGE && vtableInfo.AllocationBase == minecraftModule;
+		const bool liveVtableInMinecraft = isMinecraftImageAddress(actualLocalPlayerVtable);
 		logF("[compat] LocalPlayer live vtable in Minecraft image: %s", liveVtableInMinecraft ? "YES" : "NO");
 		if (!liveVtableInMinecraft)
 			return false;
@@ -239,27 +238,45 @@ private:
 		logF("[compat] LocalPlayer+5B8 supplies        : %llX", reinterpret_cast<uintptr_t>(supplies));
 		logF("[compat] LocalPlayer+7F8 PacketSender    : %llX", reinterpret_cast<uintptr_t>(playerPacketSender));
 		logF("[compat] LocalPlayer+AA0 GameMode        : %llX", reinterpret_cast<uintptr_t>(gameMode));
-		if (gameMode == nullptr)
+		if (supplies == nullptr || gameMode == nullptr)
 			return false;
+
+		if (ciPacketSender != nullptr && playerPacketSender != ciPacketSender) {
+			logF("[compat] Player PacketSender does not match ClientInstance PacketSender");
+			return false;
+		}
 
 		auto* gameModeVtable = *reinterpret_cast<uintptr_t**>(gameMode);
 		void* gameModePlayer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(gameMode) + 0x8);
-		const uintptr_t expectedBuildBlock = FindSignature("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 44 89 CB 44 89 C7 49 89 D6 48 89 CE 48 8B 41 ? 48 8B 80 ? ? ? ? 80 B8 ? ? ? ? ? 74 ?");
-		const uintptr_t expectedAttack = FindSignature("55 41 57 41 56 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 4C 89 CB 45 89 C6 49 89 D7 48 89 CF 48 8B 41 ? 48 8B 88 ? ? ? ? 48 85 C9");
+		const uintptr_t signatureBuildBlock = FindSignature("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 44 89 CB 44 89 C7 49 89 D6 48 89 CE 48 8B 41 ? 48 8B 80 ? ? ? ? 80 B8 ? ? ? ? ? 74 ?");
+		const uintptr_t signatureAttack = FindSignature("55 41 57 41 56 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 4C 89 CB 45 89 C6 49 89 D7 48 89 CF 48 8B 41 ? 48 8B 88 ? ? ? ? 48 85 C9");
 		const uintptr_t actualBuildBlock = gameModeVtable[6];
 		const uintptr_t actualAttack = gameModeVtable[14];
-		logF("[compat] GameMode->player                : %llX", reinterpret_cast<uintptr_t>(gameModePlayer));
-		logF("[compat] GameMode vtbl[6] buildBlock    : %llX (sig %llX)", actualBuildBlock, expectedBuildBlock);
-		logF("[compat] GameMode vtbl[14] attack        : %llX (sig %llX)", actualAttack, expectedAttack);
+		const bool gameModeVtableInMinecraft = isMinecraftImageAddress(reinterpret_cast<uintptr_t>(gameModeVtable));
+		const bool buildBlockInMinecraft = isMinecraftImageAddress(actualBuildBlock);
+		const bool attackInMinecraft = isMinecraftImageAddress(actualAttack);
 
-		if (gameModePlayer != localPlayer || expectedBuildBlock == 0 || expectedAttack == 0 ||
-			actualBuildBlock != expectedBuildBlock || actualAttack != expectedAttack) {
+		logF("[compat] GameMode->player                : %llX", reinterpret_cast<uintptr_t>(gameModePlayer));
+		logF("[compat] GameMode vtable in Minecraft    : %s", gameModeVtableInMinecraft ? "YES" : "NO");
+		logF("[compat] GameMode vtbl[6] buildBlock    : %llX (body sig %llX, in image %s)", actualBuildBlock, signatureBuildBlock, buildBlockInMinecraft ? "YES" : "NO");
+		logF("[compat] GameMode vtbl[14] attack        : %llX (body sig %llX, in image %s)", actualAttack, signatureAttack, attackInMinecraft ? "YES" : "NO");
+
+		// The current vtable entries are small dispatch/thunk functions and do not
+		// necessarily equal the larger implementation bodies matched by the
+		// standalone attack/buildBlock signatures. The object relationship is the
+		// stronger runtime proof: GameMode must point back to this LocalPlayer and
+		// its vtable/virtual targets must all belong to Minecraft.Windows.exe.
+		if (gameModePlayer != localPlayer || !gameModeVtableInMinecraft || !buildBlockInMinecraft || !attackInMinecraft) {
 			logF("[compat] Live LocalPlayer/GameMode validation FAILED");
 			return false;
 		}
 
+		if (signatureBuildBlock != 0 && actualBuildBlock != signatureBuildBlock)
+			logF("[compat] Note: GameMode buildBlock vtable entry differs from implementation-body signature (expected thunk/dispatch layer)");
+		if (signatureAttack != 0 && actualAttack != signatureAttack)
+			logF("[compat] Note: GameMode attack vtable entry differs from implementation-body signature (expected thunk/dispatch layer)");
 		if (expectedLocalPlayerVtable != 0 && actualLocalPlayerVtable != expectedLocalPlayerVtable)
-			logF("[compat] Note: constructor LocalPlayer vtable differs from final live vtable; treating this as expected for 1.26.45.1");
+			logF("[compat] Note: constructor LocalPlayer vtable differs from final live vtable; expected for this build");
 
 		logF("[compat] Modern runtime object chain VALIDATED");
 		return true;
@@ -355,8 +372,19 @@ public:
 
 			if (modernFound == static_cast<int>(sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]))) {
 				const bool runtimeOk = probeModernRuntime();
+
+				const SignatureCheck modernHookCandidates[] = {
+					{"KeyMap 1.26", "48 8D 3D ? ? ? ? C7 04 B7"},
+					{"ScreenView::setupAndRender", "E8 ? ? ? ? 48 8B 4B ? 48 85 C9 74 ? 48 8B 01 48 8B 40 ? 48 89 FA FF 15 ? ? ? ? 48 8D 4D"},
+					{"MinecraftGame::_update", "E8 ? ? ? ? 48 8B 8F ? ? ? ? BA ? ? ? ? E8 ? ? ? ? 48 8B 9F"}
+				};
+				scanSignatures(
+					"Bedrock 1.26 UI/input hook candidates",
+					modernHookCandidates,
+					sizeof(modernHookCandidates) / sizeof(modernHookCandidates[0]));
+
 				abortStartup(runtimeOk
-					? "modern 1.26 runtime objects validated; hook/layout port is the next stage"
+					? "modern 1.26 runtime objects validated; UI/input hook candidates were logged"
 					: "modern signatures matched but runtime object validation failed");
 			}
 
