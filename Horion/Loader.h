@@ -8,7 +8,10 @@
 #include <Windows.h>
 #include <winver.h>
 
+#include <cstdint>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,6 +54,13 @@ private:
 		const char* name;
 		const char* pattern;
 	};
+
+	static uintptr_t resolveRipRelative(uintptr_t instruction, size_t displacementOffset = 3, size_t instructionLength = 7) {
+		if (instruction == 0)
+			return 0;
+		const auto displacement = *reinterpret_cast<int32_t*>(instruction + displacementOffset);
+		return instruction + instructionLength + displacement;
+	}
 
 	static void logMinecraftBinaryInfo() {
 		HMODULE gameModuleHandle = GetModuleHandleA("Minecraft.Windows.exe");
@@ -108,6 +118,125 @@ private:
 		return found;
 	}
 
+	static bool probeModernRuntimeUnsafe() {
+		logF("[compat] ---- Bedrock 1.26.45 runtime object probe ----");
+
+		const uintptr_t platformSig = FindSignature("4C 89 3D ? ? ? ? 4D 85 FF");
+		const uintptr_t platformGlobal = resolveRipRelative(platformSig);
+		logF("[compat] Platform_GameCore global target : %llX", platformGlobal);
+		if (platformGlobal == 0)
+			return false;
+
+		void* winMain = *reinterpret_cast<void**>(platformGlobal);
+		void* platformGameCore = winMain != nullptr
+			? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(winMain) + 0x8)
+			: nullptr;
+		void* minecraftGame = platformGameCore != nullptr
+			? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(platformGameCore) + 0x18)
+			: nullptr;
+
+		logF("[compat] WinMain object                  : %llX", reinterpret_cast<uintptr_t>(winMain));
+		logF("[compat] Platform_GameCore              : %llX", reinterpret_cast<uintptr_t>(platformGameCore));
+		logF("[compat] MinecraftGame                  : %llX", reinterpret_cast<uintptr_t>(minecraftGame));
+		if (minecraftGame == nullptr)
+			return false;
+
+		// Current 1.26.4x client code stores the primary ClientInstance in a
+		// std::map<uint8_t, shared_ptr<ClientInstance>> at MinecraftGame+0x938.
+		// MSVC's release STL ABI is binary-compatible across the toolsets used by
+		// this project and the current Windows client, but this is still guarded
+		// by SEH in probeModernRuntime() so a layout mismatch cannot take Minecraft
+		// down during diagnostics.
+		using PrimaryClientMap = std::map<unsigned char, std::shared_ptr<C_ClientInstance>>;
+		auto* primaryClients = reinterpret_cast<PrimaryClientMap*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x938);
+		auto primary = primaryClients->find(0);
+		if (primary == primaryClients->end()) {
+			logF("[compat] Primary ClientInstance map entry 0 was not present");
+			return false;
+		}
+
+		C_ClientInstance* clientInstance = primary->second.get();
+		logF("[compat] Primary ClientInstance          : %llX", reinterpret_cast<uintptr_t>(clientInstance));
+		if (clientInstance == nullptr)
+			return false;
+
+		const uintptr_t clientVtableSig = FindSignature("48 8D 05 ? ? ? ? 49 89 45 00 48 8D 05 ? ? ? ? 49 89 45 18 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ? 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ?");
+		const uintptr_t expectedClientVtable = resolveRipRelative(clientVtableSig);
+		const uintptr_t actualClientVtable = *reinterpret_cast<uintptr_t*>(clientInstance);
+		logF("[compat] ClientInstance vtable expected  : %llX", expectedClientVtable);
+		logF("[compat] ClientInstance vtable actual    : %llX", actualClientVtable);
+		if (expectedClientVtable == 0 || actualClientVtable != expectedClientVtable) {
+			logF("[compat] ClientInstance vtable validation FAILED");
+			return false;
+		}
+
+		// Validate the modern field layout without assigning it to Horion's old
+		// C_ClientInstance fields yet; those old offsets are from the 1.18 client.
+		void* ciMinecraftGame = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1A0);
+		void* ciMinecraft = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1A8);
+		void* ciLevelRenderer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1B8);
+		void* ciPacketSender = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1C8);
+		void* ciInputHandler = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1D8);
+		void* ciGuiData = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x648);
+		void* ciOptions = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0xD78);
+
+		logF("[compat] CI+1A0 MinecraftGame            : %llX", reinterpret_cast<uintptr_t>(ciMinecraftGame));
+		logF("[compat] CI+1A8 Minecraft                : %llX", reinterpret_cast<uintptr_t>(ciMinecraft));
+		logF("[compat] CI+1B8 LevelRenderer            : %llX", reinterpret_cast<uintptr_t>(ciLevelRenderer));
+		logF("[compat] CI+1C8 PacketSender             : %llX", reinterpret_cast<uintptr_t>(ciPacketSender));
+		logF("[compat] CI+1D8 ClientInputHandler       : %llX", reinterpret_cast<uintptr_t>(ciInputHandler));
+		logF("[compat] CI+648 GuiData                  : %llX", reinterpret_cast<uintptr_t>(ciGuiData));
+		logF("[compat] CI+D78 Options                  : %llX", reinterpret_cast<uintptr_t>(ciOptions));
+
+		if (ciMinecraftGame != minecraftGame) {
+			logF("[compat] ClientInstance->MinecraftGame validation FAILED");
+			return false;
+		}
+
+		// Current ClientInstance vtable slot 0x1F is getLocalPlayer(). Call only
+		// after validating the object's vtable against the matched 1.26 signature.
+		auto* clientVtable = *reinterpret_cast<uintptr_t**>(clientInstance);
+		using GetLocalPlayerFn = C_LocalPlayer*(__fastcall*)(void*);
+		auto getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(clientVtable[0x1F]);
+		logF("[compat] ClientInstance::getLocalPlayer : %llX", reinterpret_cast<uintptr_t>(getLocalPlayer));
+		if (getLocalPlayer == nullptr)
+			return false;
+
+		C_LocalPlayer* localPlayer = getLocalPlayer(clientInstance);
+		logF("[compat] LocalPlayer                     : %llX", reinterpret_cast<uintptr_t>(localPlayer));
+		if (localPlayer == nullptr) {
+			logF("[compat] LocalPlayer is null (expected at menus; enter a world for the next probe)");
+			return true;
+		}
+
+		const uintptr_t localPlayerVtableSig = FindSignature("48 8D 05 ? ? ? ? 48 89 07 48 8D 87 08 0F 00 00 48 89 85 ? ? ? ? C6 87 30 0F 00 00 00 C6 87 39 0F 00 00 00");
+		const uintptr_t expectedLocalPlayerVtable = resolveRipRelative(localPlayerVtableSig);
+		const uintptr_t actualLocalPlayerVtable = *reinterpret_cast<uintptr_t*>(localPlayer);
+		logF("[compat] LocalPlayer vtable expected      : %llX", expectedLocalPlayerVtable);
+		logF("[compat] LocalPlayer vtable actual        : %llX", actualLocalPlayerVtable);
+
+		if (expectedLocalPlayerVtable != 0 && actualLocalPlayerVtable != expectedLocalPlayerVtable) {
+			logF("[compat] LocalPlayer vtable validation FAILED");
+			return false;
+		}
+
+		logF("[compat] Modern runtime object chain VALIDATED");
+		return true;
+	}
+
+	static bool probeModernRuntime() {
+		bool ok = false;
+		__try {
+			ok = probeModernRuntimeUnsafe();
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			logF("[compat] Runtime object probe trapped SEH exception 0x%08X", GetExceptionCode());
+			ok = false;
+		}
+		logF("[compat] Runtime object probe result: %s", ok ? "PASS" : "FAIL");
+		return ok;
+	}
+
 	[[noreturn]] static void abortStartup(const char* reason) {
 		logF("[compat] Startup stopped safely: %s", reason);
 		logF("[compat] Minecraft was left running. See %%TEMP%%\\HorionCompat.log for this trace.");
@@ -150,9 +279,6 @@ public:
 			sizeof(archivedChecks) / sizeof(archivedChecks[0]));
 
 		if (archivedFound != static_cast<int>(sizeof(archivedChecks) / sizeof(archivedChecks[0]))) {
-			// The first diagnostic set was taken from a Horion-derived client targeting
-			// Bedrock 1.21.130. Keep it as a historical bridge because one GameMode
-			// shape still survives in 1.26.45.1.
 			const SignatureCheck bridgeCandidates[] = {
 				{"ClientInstance candidate", "48 89 0D ? ? ? ? 48 89 0D ? ? ? ? 48 85 C0 74 ? 48 8B C8 E8 ? ? ? ? 48 8B 0D ? ? ? ?"},
 				{"Key input hook candidate", "48 83 EC ? 0F B6 C1 4C 8D 05"},
@@ -169,13 +295,6 @@ public:
 				bridgeCandidates,
 				sizeof(bridgeCandidates) / sizeof(bridgeCandidates[0]));
 
-			// These signatures are from actively maintained 1.26.4x-era open-source
-			// Bedrock tooling/client code. They are scan-only here: matching them does
-			// not mean Horion's old object layouts or vtable indexes are safe yet.
-			// The Platform_GameCore / ClientInstance / LocalPlayer / Player / Mob /
-			// GameMode shapes come from Necromancer (Aug 2026). The packet and mouse
-			// controls come from Spyglass, whose 1.26.40 payload explicitly covers
-			// Windows 1.26.45.1.
 			const SignatureCheck modern1264xCandidates[] = {
 				{"Platform_GameCore global", "4C 89 3D ? ? ? ? 4D 85 FF"},
 				{"ClientInstance vtable 1.26", "48 8D 05 ? ? ? ? 49 89 45 00 48 8D 05 ? ? ? ? 49 89 45 18 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ? 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ?"},
@@ -188,10 +307,17 @@ public:
 				{"MouseDevice::feed", "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 44 89 CF 44 89 C3 89 D5 48 89 CE 44 0F B7 A4 24 C0 00 00 00 44 0F B7 AC 24 B8 00 00 00 44 0F B7 BC 24 B0 00 00 00 0F B6 84 24 C8 00 00 00"}
 			};
 
-			scanSignatures(
+			const int modernFound = scanSignatures(
 				"Bedrock 1.26.4x modern candidates",
 				modern1264xCandidates,
 				sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]));
+
+			if (modernFound == static_cast<int>(sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]))) {
+				const bool runtimeOk = probeModernRuntime();
+				abortStartup(runtimeOk
+					? "modern 1.26 runtime objects validated; hook/layout port is the next stage"
+					: "modern signatures matched but runtime object validation failed");
+			}
 
 			abortStartup("archived signatures are stale; modern 1.26.4x candidate results were logged");
 		}
