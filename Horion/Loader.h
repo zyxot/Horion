@@ -150,12 +150,10 @@ public:
 			sizeof(archivedChecks) / sizeof(archivedChecks[0]));
 
 		if (archivedFound != static_cast<int>(sizeof(archivedChecks) / sizeof(archivedChecks[0]))) {
-			// These candidates come from a newer open-source Horion-derived codebase
-			// targeting Bedrock 1.21.130. They are diagnostic only: Xorion itself
-			// marks that target as not-yet-working, so matching a candidate is not
-			// enough to safely install a hook. The results tell us whether your
-			// binary is in the same general generation before we port layouts/indexes.
-			const SignatureCheck newerCandidates[] = {
+			// The first diagnostic set was taken from a Horion-derived client targeting
+			// Bedrock 1.21.130. Keep it as a historical bridge because one GameMode
+			// shape still survives in 1.26.45.1.
+			const SignatureCheck bridgeCandidates[] = {
 				{"ClientInstance candidate", "48 89 0D ? ? ? ? 48 89 0D ? ? ? ? 48 85 C0 74 ? 48 8B C8 E8 ? ? ? ? 48 8B 0D ? ? ? ?"},
 				{"Key input hook candidate", "48 83 EC ? 0F B6 C1 4C 8D 05"},
 				{"GameMode vtable candidate", "48 8D 05 ? ? ? ? 48 89 01 48 89 51 ? 48 C7 41 ? ? ? ? ? C7 41"},
@@ -167,11 +165,35 @@ public:
 			};
 
 			scanSignatures(
-				"Newer 1.21.130-derived diagnostic candidates",
-				newerCandidates,
-				sizeof(newerCandidates) / sizeof(newerCandidates[0]));
+				"1.21.130 bridge candidates",
+				bridgeCandidates,
+				sizeof(bridgeCandidates) / sizeof(bridgeCandidates[0]));
 
-			abortStartup("archived signatures are stale; newer candidate results were logged");
+			// These signatures are from actively maintained 1.26.4x-era open-source
+			// Bedrock tooling/client code. They are scan-only here: matching them does
+			// not mean Horion's old object layouts or vtable indexes are safe yet.
+			// The Platform_GameCore / ClientInstance / LocalPlayer / Player / Mob /
+			// GameMode shapes come from Necromancer (Aug 2026). The packet and mouse
+			// controls come from Spyglass, whose 1.26.40 payload explicitly covers
+			// Windows 1.26.45.1.
+			const SignatureCheck modern1264xCandidates[] = {
+				{"Platform_GameCore global", "4C 89 3D ? ? ? ? 4D 85 FF"},
+				{"ClientInstance vtable 1.26", "48 8D 05 ? ? ? ? 49 89 45 00 48 8D 05 ? ? ? ? 49 89 45 18 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ? 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ?"},
+				{"LocalPlayer vtable 1.26", "48 8D 05 ? ? ? ? 48 89 07 48 8D 87 08 0F 00 00 48 89 85 ? ? ? ? C6 87 30 0F 00 00 00 C6 87 39 0F 00 00 00"},
+				{"Player vtable 1.26", "48 8D 0D ? ? ? ? 49 89 0C 24 41 89 84 24 B8 0C 00 00 49 8D 84 24 C0 0C 00 00"},
+				{"Mob vtable 1.26", "48 8D 05 ? ? ? ? 48 89 07 66 0F EF C0 F3 0F 7F 87 68 04 00 00 48 89 BD ? ? ? ? 48 C7 87 78 04 00 00 ? ? ? ?"},
+				{"GameMode::attack 1.26", "55 41 57 41 56 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 4C 89 CB 45 89 C6 49 89 D7 48 89 CF 48 8B 41 ? 48 8B 88 ? ? ? ? 48 85 C9"},
+				{"GameMode::buildBlock 1.26", "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 44 89 CB 44 89 C7 49 89 D6 48 89 CE 48 8B 41 ? 48 8B 80 ? ? ? ? 80 B8 ? ? ? ? ? 74 ?"},
+				{"MinecraftPackets::createPacket", "56 48 83 EC 20 48 89 CE 81 FA ? 01 00 00 77 ? 89 D0 48 8D 0D ? ? ? ? 48 63 04 81 48 01 C8 FF E0 0F 57 C0 0F 11 06 48 89 F0 48 83 C4 20 5E"},
+				{"MouseDevice::feed", "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 44 89 CF 44 89 C3 89 D5 48 89 CE 44 0F B7 A4 24 C0 00 00 00 44 0F B7 AC 24 B8 00 00 00 44 0F B7 BC 24 B0 00 00 00 0F B6 84 24 C8 00 00 00"}
+			};
+
+			scanSignatures(
+				"Bedrock 1.26.4x modern candidates",
+				modern1264xCandidates,
+				sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]));
+
+			abortStartup("archived signatures are stale; modern 1.26.4x candidate results were logged");
 		}
 
 		logF("[compat] Critical archived signatures matched; entering archived GameData initialization");
