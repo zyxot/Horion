@@ -2,10 +2,10 @@
 
 // Minimal Bedrock 1.26.45.1 runtime bridge.
 //
-// This deliberately does NOT enable Horion's archived 1.18 hook table.  The
+// This deliberately does NOT enable Horion's archived 1.18 hook table. The
 // old hook initializer dereferences stale signatures and is the reason the
-// unmodified client crashes on current Minecraft.  Instead we first keep the
-// DLL alive with two current, pass-through hooks and the current KeyMap.  Once
+// unmodified client crashes on current Minecraft. Instead we first keep the
+// DLL alive with two current, pass-through hooks and the current KeyMap. Once
 // this bridge is proven stable, the old Horion systems can be ported onto it
 // one subsystem at a time.
 namespace Modern126Runtime {
@@ -121,7 +121,7 @@ namespace Modern126Runtime {
 
 	inline bool tryStart(HMODULE module) {
 		// Only activate this bridge when the signatures verified on the user's
-		// Minecraft.Windows.exe 1.26.45.1 are all present.  Otherwise the archived
+		// Minecraft.Windows.exe 1.26.45.1 are all present. Otherwise the archived
 		// diagnostic path remains in control and fails closed.
 		const uintptr_t platformSig = FindSignature("4C 89 3D ? ? ? ? 4D 85 FF");
 		const uintptr_t clientVtableSig = FindSignature("48 8D 05 ? ? ? ? 49 89 45 00 48 8D 05 ? ? ? ? 49 89 45 18 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ? 48 8D 05 ? ? ? ? 49 89 85 ? ? ? ?");
