@@ -137,7 +137,7 @@ namespace Modern126Extras {
 		if (top < 12.0f)
 			top = 12.0f;
 
-		const auto drawRow = [&](const wchar_t* text, float width) mutable {
+		auto drawRow = [&](const wchar_t* text, float width) {
 			const D2D1_RECT_F bg = { 14.0f, top, width, top + 28.0f };
 			const D2D1_RECT_F textRect = { 24.0f, top + 2.0f, width - 8.0f, top + 26.0f };
 			context->FillRectangle(bg, panelBrush);
@@ -158,7 +158,7 @@ namespace Modern126Extras {
 		if (directionEnabled) {
 			float normalized = std::fmod(telemetry.yaw, 360.0f);
 			if (normalized < 0.0f) normalized += 360.0f;
-			swprintf_s(text, _countof(text), L"Facing: %s  %.0f deg", directionName(telemetry.yaw), normalized);
+			swprintf_s(text, _countof(text), L"Facing: %ls  %.0f deg", directionName(telemetry.yaw), normalized);
 			drawRow(text, 245.0f);
 		}
 	}
