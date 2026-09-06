@@ -17,9 +17,8 @@
 #pragma comment(lib, "dxgi.lib")
 
 // Stable current-Bedrock overlay path: IDXGISwapChain::Present -> D3D11On12 ->
-// Direct2D/DirectWrite. The input canary below only observes the Windows cursor
-// and left button while the test menu is visible; it does not cancel or alter
-// Minecraft input.
+// Direct2D/DirectWrite. This stage starts the real 1.26 feature layer with a
+// working Visuals module while leaving Minecraft input untouched.
 namespace Modern126PresentProbe {
 	inline std::unique_ptr<FuncHook> presentHook;
 	inline std::unique_ptr<FuncHook> executeCommandListsHook;
@@ -32,7 +31,7 @@ namespace Modern126PresentProbe {
 	inline bool loggedRendererFailure = false;
 	inline bool loggedMouseReady = false;
 	inline uint64_t presentCount = 0;
-	inline uint64_t clickCount = 0;
+	inline uint64_t featureToggleCount = 0;
 	inline DWORD lastPresentLogTick = 0;
 
 	inline IDXGISwapChain3* rendererChain3 = nullptr;
@@ -61,7 +60,10 @@ namespace Modern126PresentProbe {
 	inline POINT mouseClient = {};
 	inline bool mouseValid = false;
 	inline bool leftWasDown = false;
-	inline bool clickTestEnabled = false;
+
+	// First real modern module. This is intentionally renderer-only so the UI and
+	// module lifecycle can be proven before reconnecting gameplay memory features.
+	inline bool crosshairEnabled = false;
 
 	template <typename T>
 	inline void releaseCom(T*& value) {
@@ -302,13 +304,28 @@ namespace Modern126PresentProbe {
 		mouseValid = true;
 		if (!loggedMouseReady) {
 			loggedMouseReady = true;
-			logF("[modern] Present mouse observation active; clicks are not intercepted");
+			logF("[modern] Present mouse observation active; feature clicks are not intercepted");
 		}
 		return true;
 	}
 
+	inline void drawCrosshair(ID2D1Bitmap1* target) {
+		if (!crosshairEnabled || target == nullptr)
+			return;
+
+		const D2D1_SIZE_F size = target->GetSize();
+		const float centerX = size.width * 0.5f;
+		const float centerY = size.height * 0.5f;
+		const D2D1_RECT_F horizontal = { centerX - 8.0f, centerY - 1.0f, centerX + 8.0f, centerY + 1.0f };
+		const D2D1_RECT_F vertical = { centerX - 1.0f, centerY - 8.0f, centerX + 1.0f, centerY + 8.0f };
+		d2dContext->FillRectangle(horizontal, textBrush);
+		d2dContext->FillRectangle(vertical, textBrush);
+	}
+
 	inline void drawPresentOverlay(IDXGISwapChain* chain) {
-		if (!Modern126Overlay::visible || chain == nullptr || capturedCommandQueue == nullptr)
+		if (chain == nullptr || capturedCommandQueue == nullptr)
+			return;
+		if (!Modern126Overlay::visible && !crosshairEnabled)
 			return;
 		if (!initializeRenderer(chain))
 			return;
@@ -322,69 +339,62 @@ namespace Modern126PresentProbe {
 			return;
 		}
 
-		updateMouse();
-		const D2D1_RECT_F buttonRect = { 38.0f, 185.0f, 272.0f, 226.0f };
-		const bool hovered = mouseValid && pointInside(mouseClient, buttonRect);
-		const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-		if (hovered && leftDown && !leftWasDown) {
-			clickTestEnabled = !clickTestEnabled;
-			++clickCount;
-			logF("[modern] Present input canary click #%llu x=%ld y=%ld state=%s",
-				static_cast<unsigned long long>(clickCount), mouseClient.x, mouseClient.y,
-				clickTestEnabled ? "ON" : "OFF");
+		const D2D1_RECT_F crosshairButtonRect = { 38.0f, 116.0f, 272.0f, 157.0f };
+		bool crosshairHovered = false;
+		if (Modern126Overlay::visible) {
+			updateMouse();
+			crosshairHovered = mouseValid && pointInside(mouseClient, crosshairButtonRect);
+			const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+			if (crosshairHovered && leftDown && !leftWasDown) {
+				crosshairEnabled = !crosshairEnabled;
+				++featureToggleCount;
+				logF("[modern] Visuals/Crosshair toggle #%llu state=%s",
+					static_cast<unsigned long long>(featureToggleCount),
+					crosshairEnabled ? "ON" : "OFF");
+			}
+			leftWasDown = leftDown;
+		} else {
+			mouseValid = false;
+			leftWasDown = false;
 		}
-		leftWasDown = leftDown;
 
 		ID3D11Resource* wrapped = wrappedTargets[index];
 		bridge11On12->AcquireWrappedResources(&wrapped, 1);
 		d2dContext->SetTarget(d2dTargets[index]);
 		d2dContext->BeginDraw();
 
-		const D2D1_RECT_F panel = { 24.0f, 24.0f, 454.0f, 250.0f };
-		const D2D1_RECT_F header = { 24.0f, 24.0f, 454.0f, 62.0f };
-		d2dContext->FillRectangle(panel, panelBrush);
-		d2dContext->FillRectangle(header, headerBrush);
+		if (Modern126Overlay::visible) {
+			const D2D1_RECT_F panel = { 24.0f, 24.0f, 454.0f, 220.0f };
+			const D2D1_RECT_F header = { 24.0f, 24.0f, 454.0f, 62.0f };
+			d2dContext->FillRectangle(panel, panelBrush);
+			d2dContext->FillRectangle(header, headerBrush);
 
-		static const wchar_t title[] = L"HORION 1.26 UI BRIDGE";
-		static const wchar_t line1[] = L"Stable Present renderer: Direct2D + DirectWrite";
-		static const wchar_t line2[] = L"Mouse canary: move over the button and click";
-		const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 444.0f, 59.0f };
-		const D2D1_RECT_F line1Rect = { 38.0f, 79.0f, 444.0f, 108.0f };
-		const D2D1_RECT_F line2Rect = { 38.0f, 116.0f, 444.0f, 145.0f };
-		d2dContext->DrawText(title, _countof(title) - 1, titleFormat, titleRect, textBrush);
-		d2dContext->DrawText(line1, _countof(line1) - 1, bodyFormat, line1Rect, textBrush);
-		d2dContext->DrawText(line2, _countof(line2) - 1, bodyFormat, line2Rect, textBrush);
+			static const wchar_t title[] = L"HORION 1.26";
+			static const wchar_t category[] = L"VISUALS";
+			static const wchar_t hint[] = L"First modern feature module";
+			const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 444.0f, 59.0f };
+			const D2D1_RECT_F categoryRect = { 38.0f, 78.0f, 444.0f, 105.0f };
+			const D2D1_RECT_F hintRect = { 155.0f, 78.0f, 444.0f, 105.0f };
+			d2dContext->DrawText(title, _countof(title) - 1, titleFormat, titleRect, textBrush);
+			d2dContext->DrawText(category, _countof(category) - 1, bodyFormat, categoryRect, textBrush);
+			d2dContext->DrawText(hint, _countof(hint) - 1, bodyFormat, hintRect, textBrush);
 
-		wchar_t mouseStatus[128] = {};
-		if (mouseValid) {
-			swprintf_s(mouseStatus, _countof(mouseStatus), L"Mouse: %ld, %ld   Click test: %s",
-				mouseClient.x, mouseClient.y, clickTestEnabled ? L"ON" : L"OFF");
-		} else {
-			wcscpy_s(mouseStatus, L"Mouse: unavailable");
-		}
-		const D2D1_RECT_F mouseRect = { 38.0f, 151.0f, 444.0f, 179.0f };
-		d2dContext->DrawText(mouseStatus, static_cast<UINT32>(wcslen(mouseStatus)), bodyFormat, mouseRect, textBrush);
+			ID2D1SolidColorBrush* buttonBrush = crosshairEnabled ? activeBrush :
+				(crosshairHovered ? hoverBrush : headerBrush);
+			d2dContext->FillRectangle(crosshairButtonRect, buttonBrush);
+			static const wchar_t crosshairOff[] = L"CROSSHAIR: OFF";
+			static const wchar_t crosshairOn[] = L"CROSSHAIR: ON";
+			const wchar_t* buttonText = crosshairEnabled ? crosshairOn : crosshairOff;
+			const UINT32 buttonLength = crosshairEnabled ? _countof(crosshairOn) - 1 : _countof(crosshairOff) - 1;
+			const D2D1_RECT_F buttonTextRect = { 50.0f, 124.0f, 264.0f, 153.0f };
+			d2dContext->DrawText(buttonText, buttonLength, bodyFormat, buttonTextRect, textBrush);
 
-		ID2D1SolidColorBrush* buttonBrush = clickTestEnabled ? activeBrush : (hovered ? hoverBrush : headerBrush);
-		d2dContext->FillRectangle(buttonRect, buttonBrush);
-		static const wchar_t buttonOff[] = L"CLICK TEST: OFF";
-		static const wchar_t buttonOn[] = L"CLICK TEST: ON";
-		const wchar_t* buttonText = clickTestEnabled ? buttonOn : buttonOff;
-		const UINT32 buttonLength = clickTestEnabled ? _countof(buttonOn) - 1 : _countof(buttonOff) - 1;
-		const D2D1_RECT_F buttonTextRect = { 50.0f, 193.0f, 264.0f, 222.0f };
-		d2dContext->DrawText(buttonText, buttonLength, bodyFormat, buttonTextRect, textBrush);
-
-		if (mouseValid) {
-			const D2D1_RECT_F marker = {
-				static_cast<float>(mouseClient.x) - 3.0f, static_cast<float>(mouseClient.y) - 3.0f,
-				static_cast<float>(mouseClient.x) + 3.0f, static_cast<float>(mouseClient.y) + 3.0f
-			};
-			d2dContext->FillRectangle(marker, textBrush);
+			static const wchar_t footer[] = L"INSERT closes menu   |   CTRL+L unloads";
+			const D2D1_RECT_F footerRect = { 38.0f, 174.0f, 446.0f, 210.0f };
+			d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
 		}
 
-		static const wchar_t footer[] = L"INSERT closes menu   |   CTRL+L unloads";
-		const D2D1_RECT_F footerRect = { 290.0f, 195.0f, 446.0f, 240.0f };
-		d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
+		drawCrosshair(d2dTargets[index]);
 
 		const HRESULT drawHr = d2dContext->EndDraw();
 		bridge11On12->ReleaseWrappedResources(&wrapped, 1);
@@ -399,7 +409,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D UI + mouse canary rendered successfully");
+			logF("[modern] Present Direct2D feature UI rendered successfully; Crosshair module ready");
 		}
 	}
 
@@ -419,12 +429,13 @@ namespace Modern126PresentProbe {
 
 			const char* api = SUCCEEDED(hr12) && device12 != nullptr ? "DX12" :
 				(SUCCEEDED(hr11) && device11 != nullptr ? "DX11" : "UNKNOWN");
-			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s",
+			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s crosshair=%s",
 				static_cast<unsigned long long>(presentCount),
 				reinterpret_cast<uintptr_t>(chain), api,
 				reinterpret_cast<uintptr_t>(capturedCommandQueue),
 				Modern126Overlay::visible ? "ON" : "OFF",
-				rendererReady ? "READY" : "WAIT");
+				rendererReady ? "READY" : "WAIT",
+				crosshairEnabled ? "ON" : "OFF");
 			loggedPresent = true;
 			lastPresentLogTick = now;
 
@@ -549,6 +560,7 @@ namespace Modern126PresentProbe {
 		started = true;
 		logF("[modern] DXGI Present renderer installed Present=%llX ExecuteCommandLists=%llX",
 			presentTarget, executeTarget);
+		logF("[modern] First modern feature registered: Visuals/Crosshair");
 		return true;
 	}
 
