@@ -1,0 +1,14 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Compatibility overrides for building the archived Horion project on a
+    modern Visual Studio installation.
+
+    The original project contains machine-specific VS2017 / DirectX paths.
+    Keep the project source intact and replace those paths at the end of the
+    MSBuild import chain instead.
+  -->
+  <PropertyGroup Condition="'$(Platform)' == 'x64'">
+    <LibraryPath>$(ProjectDir)minhook;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);$(NETFXKitsDir)Lib\um\x64</LibraryPath>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(ProjectDir)include;$(ProjectDir)include\glm;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+</Project>
