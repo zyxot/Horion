@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Modern126Overlay.h"
+#include "Modern126Gameplay.h"
 #include "Modern126PresentProbe.h"
 
 // Minimal Bedrock 1.26.45.1 runtime bridge.
@@ -147,9 +148,6 @@ namespace Modern126Runtime {
 		}
 
 		if (cursorReleasedForOverlay) {
-			// Only re-grab in an active gameplay session. If the player disappeared
-			// (for example, returning to the title screen), leave cursor ownership to
-			// Minecraft instead of calling gameplay cursor code on stale state.
 			if (clientInstance != nullptr && localPlayer != nullptr && grabCursorHook) {
 				auto originalGrab = grabCursorHook->GetFastcall<void, void*>();
 				originalGrab(clientInstance);
@@ -180,9 +178,6 @@ namespace Modern126Runtime {
 			return;
 		}
 
-		// Exact 1.26.45.1 can fail the maintained grab/release signatures even
-		// though the MinecraftGame object layout is already validated. In that
-		// case, use the current mouseGrabbed field as a narrow compatibility fallback.
 		if (!rawCursorOverrideActive) {
 			bool previous = true;
 			if (!readRawCursorGrabbed(&previous)) {
@@ -212,6 +207,7 @@ namespace Modern126Runtime {
 		auto original = minecraftUpdateHook->GetFastcall<void, void*>();
 		original(game);
 		refreshLocalPlayer();
+		Modern126Gameplay::tickFromGameUpdate(localPlayer);
 		syncCursorForOverlay();
 		if (!loggedUpdateHook) {
 			loggedUpdateHook = true;
@@ -364,9 +360,6 @@ namespace Modern126Runtime {
 		minecraftUpdateHook->enableHook();
 		hooksEnabled = true;
 
-		// Cursor lifecycle support is optional. The current maintained signatures
-		// are attempted first, but exact 1.26.45.1 builds can differ. If they do,
-		// the raw MinecraftGame +0x1D8 compatibility path remains available.
 		const uintptr_t grabCursorTarget = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 48 83 EC");
 		const uintptr_t releaseCursorCandidate = FindSignature("56 48 83 EC ? 48 89 CE 48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 84 C0 74 ? 48 8B 8E ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 83 C4 ? 5E 48 FF E2 90 48 83 C4 ? 5E C3 CC CC CC CC CC CC CC CC CC CC CC CC CC 56 53");
 		if (addressInMinecraft(grabCursorTarget) && addressInMinecraft(releaseCursorCandidate) &&
