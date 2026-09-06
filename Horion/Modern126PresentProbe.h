@@ -17,8 +17,8 @@
 #pragma comment(lib, "dxgi.lib")
 
 // Stable current-Bedrock overlay path: IDXGISwapChain::Present -> D3D11On12 ->
-// Direct2D/DirectWrite. This stage starts the real 1.26 feature layer with a
-// working Visuals module while leaving Minecraft input untouched.
+// Direct2D/DirectWrite. This layer contains only renderer/HUD features; gameplay
+// memory modules stay disabled until their 1.26 layouts are validated separately.
 namespace Modern126PresentProbe {
 	inline std::unique_ptr<FuncHook> presentHook;
 	inline std::unique_ptr<FuncHook> executeCommandListsHook;
@@ -61,15 +61,39 @@ namespace Modern126PresentProbe {
 	inline bool mouseValid = false;
 	inline bool leftWasDown = false;
 
-	// First real modern module. This is intentionally renderer-only so the UI and
-	// module lifecycle can be proven before reconnecting gameplay memory features.
+	// Modern renderer-only modules.
 	inline bool crosshairEnabled = false;
+	inline bool watermarkEnabled = false;
+	inline bool fpsEnabled = false;
+	inline bool moduleListEnabled = false;
+	inline ULONGLONG fpsWindowStart = 0;
+	inline uint32_t fpsWindowFrames = 0;
+	inline uint32_t currentFps = 0;
 
 	template <typename T>
 	inline void releaseCom(T*& value) {
 		if (value != nullptr) {
 			value->Release();
 			value = nullptr;
+		}
+	}
+
+	inline bool anyPersistentFeatureEnabled() {
+		return crosshairEnabled || watermarkEnabled || fpsEnabled || moduleListEnabled;
+	}
+
+	inline void tickFps() {
+		const ULONGLONG now = GetTickCount64();
+		if (fpsWindowStart == 0)
+			fpsWindowStart = now;
+		++fpsWindowFrames;
+		const ULONGLONG elapsed = now - fpsWindowStart;
+		if (elapsed >= 1000) {
+			currentFps = elapsed != 0
+				? static_cast<uint32_t>((static_cast<uint64_t>(fpsWindowFrames) * 1000ull) / elapsed)
+				: 0;
+			fpsWindowFrames = 0;
+			fpsWindowStart = now;
 		}
 	}
 
@@ -312,7 +336,6 @@ namespace Modern126PresentProbe {
 	inline void drawCrosshair(ID2D1Bitmap1* target) {
 		if (!crosshairEnabled || target == nullptr)
 			return;
-
 		const D2D1_SIZE_F size = target->GetSize();
 		const float centerX = size.width * 0.5f;
 		const float centerY = size.height * 0.5f;
@@ -322,10 +345,67 @@ namespace Modern126PresentProbe {
 		d2dContext->FillRectangle(vertical, textBrush);
 	}
 
+	inline void drawWatermark() {
+		if (!watermarkEnabled)
+			return;
+		const D2D1_RECT_F background = { 14.0f, 14.0f, 154.0f, 48.0f };
+		const D2D1_RECT_F accent = { 14.0f, 14.0f, 18.0f, 48.0f };
+		const D2D1_RECT_F textRect = { 28.0f, 18.0f, 150.0f, 46.0f };
+		d2dContext->FillRectangle(background, panelBrush);
+		d2dContext->FillRectangle(accent, headerBrush);
+		static const wchar_t text[] = L"Horion 1.26";
+		d2dContext->DrawText(text, _countof(text) - 1, bodyFormat, textRect, textBrush);
+	}
+
+	inline void drawFps() {
+		if (!fpsEnabled)
+			return;
+		wchar_t text[48] = {};
+		swprintf_s(text, _countof(text), L"FPS: %u", currentFps);
+		const float top = watermarkEnabled ? 54.0f : 14.0f;
+		const D2D1_RECT_F background = { 14.0f, top, 120.0f, top + 30.0f };
+		const D2D1_RECT_F textRect = { 24.0f, top + 3.0f, 116.0f, top + 28.0f };
+		d2dContext->FillRectangle(background, panelBrush);
+		d2dContext->DrawText(text, static_cast<UINT32>(wcslen(text)), bodyFormat, textRect, textBrush);
+	}
+
+	inline void drawModuleList(ID2D1Bitmap1* target) {
+		if (!moduleListEnabled || target == nullptr)
+			return;
+		const D2D1_SIZE_F size = target->GetSize();
+		const float left = size.width > 230.0f ? size.width - 215.0f : 10.0f;
+		float top = 16.0f;
+		const D2D1_RECT_F titleBg = { left, top, size.width - 14.0f, top + 30.0f };
+		const D2D1_RECT_F titleRect = { left + 10.0f, top + 3.0f, size.width - 20.0f, top + 28.0f };
+		d2dContext->FillRectangle(titleBg, headerBrush);
+		static const wchar_t title[] = L"ENABLED MODULES";
+		d2dContext->DrawText(title, _countof(title) - 1, bodyFormat, titleRect, textBrush);
+		top += 34.0f;
+
+		const auto drawEntry = [&](const wchar_t* text) {
+			const D2D1_RECT_F bg = { left, top, size.width - 14.0f, top + 28.0f };
+			const D2D1_RECT_F rect = { left + 10.0f, top + 2.0f, size.width - 20.0f, top + 26.0f };
+			d2dContext->FillRectangle(bg, panelBrush);
+			d2dContext->DrawText(text, static_cast<UINT32>(wcslen(text)), bodyFormat, rect, textBrush);
+			top += 30.0f;
+		};
+
+		if (crosshairEnabled) drawEntry(L"Crosshair");
+		if (watermarkEnabled) drawEntry(L"Watermark");
+		if (fpsEnabled) drawEntry(L"FPS Counter");
+		if (moduleListEnabled) drawEntry(L"Module List");
+	}
+
+	inline void logFeatureToggle(const char* name, bool enabled) {
+		++featureToggleCount;
+		logF("[modern] %s toggle #%llu state=%s", name,
+			static_cast<unsigned long long>(featureToggleCount), enabled ? "ON" : "OFF");
+	}
+
 	inline void drawPresentOverlay(IDXGISwapChain* chain) {
 		if (chain == nullptr || capturedCommandQueue == nullptr)
 			return;
-		if (!Modern126Overlay::visible && !crosshairEnabled)
+		if (!Modern126Overlay::visible && !anyPersistentFeatureEnabled())
 			return;
 		if (!initializeRenderer(chain))
 			return;
@@ -339,18 +419,36 @@ namespace Modern126PresentProbe {
 			return;
 		}
 
-		const D2D1_RECT_F crosshairButtonRect = { 38.0f, 116.0f, 272.0f, 157.0f };
-		bool crosshairHovered = false;
+		const D2D1_RECT_F crosshairButton = { 38.0f, 116.0f, 286.0f, 157.0f };
+		const D2D1_RECT_F watermarkButton = { 318.0f, 116.0f, 566.0f, 157.0f };
+		const D2D1_RECT_F fpsButton = { 318.0f, 168.0f, 566.0f, 209.0f };
+		const D2D1_RECT_F moduleListButton = { 318.0f, 220.0f, 566.0f, 261.0f };
+		bool hoverCrosshair = false;
+		bool hoverWatermark = false;
+		bool hoverFps = false;
+		bool hoverModuleList = false;
+
 		if (Modern126Overlay::visible) {
 			updateMouse();
-			crosshairHovered = mouseValid && pointInside(mouseClient, crosshairButtonRect);
+			hoverCrosshair = mouseValid && pointInside(mouseClient, crosshairButton);
+			hoverWatermark = mouseValid && pointInside(mouseClient, watermarkButton);
+			hoverFps = mouseValid && pointInside(mouseClient, fpsButton);
+			hoverModuleList = mouseValid && pointInside(mouseClient, moduleListButton);
 			const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-			if (crosshairHovered && leftDown && !leftWasDown) {
-				crosshairEnabled = !crosshairEnabled;
-				++featureToggleCount;
-				logF("[modern] Visuals/Crosshair toggle #%llu state=%s",
-					static_cast<unsigned long long>(featureToggleCount),
-					crosshairEnabled ? "ON" : "OFF");
+			if (leftDown && !leftWasDown) {
+				if (hoverCrosshair) {
+					crosshairEnabled = !crosshairEnabled;
+					logFeatureToggle("Visuals/Crosshair", crosshairEnabled);
+				} else if (hoverWatermark) {
+					watermarkEnabled = !watermarkEnabled;
+					logFeatureToggle("HUD/Watermark", watermarkEnabled);
+				} else if (hoverFps) {
+					fpsEnabled = !fpsEnabled;
+					logFeatureToggle("HUD/FPS Counter", fpsEnabled);
+				} else if (hoverModuleList) {
+					moduleListEnabled = !moduleListEnabled;
+					logFeatureToggle("HUD/Module List", moduleListEnabled);
+				}
 			}
 			leftWasDown = leftDown;
 		} else {
@@ -364,37 +462,47 @@ namespace Modern126PresentProbe {
 		d2dContext->BeginDraw();
 
 		if (Modern126Overlay::visible) {
-			const D2D1_RECT_F panel = { 24.0f, 24.0f, 454.0f, 220.0f };
-			const D2D1_RECT_F header = { 24.0f, 24.0f, 454.0f, 62.0f };
+			const D2D1_RECT_F panel = { 24.0f, 24.0f, 580.0f, 318.0f };
+			const D2D1_RECT_F header = { 24.0f, 24.0f, 580.0f, 62.0f };
 			d2dContext->FillRectangle(panel, panelBrush);
 			d2dContext->FillRectangle(header, headerBrush);
 
 			static const wchar_t title[] = L"HORION 1.26";
-			static const wchar_t category[] = L"VISUALS";
-			static const wchar_t hint[] = L"First modern feature module";
-			const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 444.0f, 59.0f };
-			const D2D1_RECT_F categoryRect = { 38.0f, 78.0f, 444.0f, 105.0f };
-			const D2D1_RECT_F hintRect = { 155.0f, 78.0f, 444.0f, 105.0f };
+			static const wchar_t visuals[] = L"VISUALS";
+			static const wchar_t hud[] = L"HUD";
+			const D2D1_RECT_F titleRect = { 36.0f, 31.0f, 570.0f, 59.0f };
+			const D2D1_RECT_F visualsRect = { 38.0f, 78.0f, 286.0f, 105.0f };
+			const D2D1_RECT_F hudRect = { 318.0f, 78.0f, 566.0f, 105.0f };
 			d2dContext->DrawText(title, _countof(title) - 1, titleFormat, titleRect, textBrush);
-			d2dContext->DrawText(category, _countof(category) - 1, bodyFormat, categoryRect, textBrush);
-			d2dContext->DrawText(hint, _countof(hint) - 1, bodyFormat, hintRect, textBrush);
+			d2dContext->DrawText(visuals, _countof(visuals) - 1, bodyFormat, visualsRect, textBrush);
+			d2dContext->DrawText(hud, _countof(hud) - 1, bodyFormat, hudRect, textBrush);
 
-			ID2D1SolidColorBrush* buttonBrush = crosshairEnabled ? activeBrush :
-				(crosshairHovered ? hoverBrush : headerBrush);
-			d2dContext->FillRectangle(crosshairButtonRect, buttonBrush);
-			static const wchar_t crosshairOff[] = L"CROSSHAIR: OFF";
-			static const wchar_t crosshairOn[] = L"CROSSHAIR: ON";
-			const wchar_t* buttonText = crosshairEnabled ? crosshairOn : crosshairOff;
-			const UINT32 buttonLength = crosshairEnabled ? _countof(crosshairOn) - 1 : _countof(crosshairOff) - 1;
-			const D2D1_RECT_F buttonTextRect = { 50.0f, 124.0f, 264.0f, 153.0f };
-			d2dContext->DrawText(buttonText, buttonLength, bodyFormat, buttonTextRect, textBrush);
+			const auto drawToggle = [&](const D2D1_RECT_F& rect, bool enabled, bool hovered,
+				const wchar_t* onText, const wchar_t* offText) {
+				ID2D1SolidColorBrush* brush = enabled ? activeBrush : (hovered ? hoverBrush : headerBrush);
+				d2dContext->FillRectangle(rect, brush);
+				const wchar_t* text = enabled ? onText : offText;
+				const D2D1_RECT_F textRect = { rect.left + 12.0f, rect.top + 8.0f, rect.right - 8.0f, rect.bottom - 4.0f };
+				d2dContext->DrawText(text, static_cast<UINT32>(wcslen(text)), bodyFormat, textRect, textBrush);
+			};
 
+			drawToggle(crosshairButton, crosshairEnabled, hoverCrosshair, L"CROSSHAIR: ON", L"CROSSHAIR: OFF");
+			drawToggle(watermarkButton, watermarkEnabled, hoverWatermark, L"WATERMARK: ON", L"WATERMARK: OFF");
+			drawToggle(fpsButton, fpsEnabled, hoverFps, L"FPS COUNTER: ON", L"FPS COUNTER: OFF");
+			drawToggle(moduleListButton, moduleListEnabled, hoverModuleList, L"MODULE LIST: ON", L"MODULE LIST: OFF");
+
+			static const wchar_t note[] = L"Renderer-only modules - gameplay modules remain disabled";
 			static const wchar_t footer[] = L"INSERT closes menu   |   CTRL+L unloads";
-			const D2D1_RECT_F footerRect = { 38.0f, 174.0f, 446.0f, 210.0f };
+			const D2D1_RECT_F noteRect = { 38.0f, 270.0f, 570.0f, 292.0f };
+			const D2D1_RECT_F footerRect = { 38.0f, 292.0f, 570.0f, 314.0f };
+			d2dContext->DrawText(note, _countof(note) - 1, bodyFormat, noteRect, textBrush);
 			d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
 		}
 
 		drawCrosshair(d2dTargets[index]);
+		drawWatermark();
+		drawFps();
+		drawModuleList(d2dTargets[index]);
 
 		const HRESULT drawHr = d2dContext->EndDraw();
 		bridge11On12->ReleaseWrappedResources(&wrapped, 1);
@@ -409,7 +517,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D feature UI rendered successfully; Crosshair module ready");
+			logF("[modern] Present Direct2D feature UI rendered successfully; Visuals + HUD modules ready");
 		}
 	}
 
@@ -417,6 +525,7 @@ namespace Modern126PresentProbe {
 		auto original = presentHook->GetFastcall<HRESULT, IDXGISwapChain*, UINT, UINT>();
 
 		++presentCount;
+		tickFps();
 		drawPresentOverlay(chain);
 
 		const DWORD now = GetTickCount();
@@ -429,13 +538,14 @@ namespace Modern126PresentProbe {
 
 			const char* api = SUCCEEDED(hr12) && device12 != nullptr ? "DX12" :
 				(SUCCEEDED(hr11) && device11 != nullptr ? "DX11" : "UNKNOWN");
-			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s crosshair=%s",
+			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/W%d/F%d/L%d",
 				static_cast<unsigned long long>(presentCount),
 				reinterpret_cast<uintptr_t>(chain), api,
 				reinterpret_cast<uintptr_t>(capturedCommandQueue),
 				Modern126Overlay::visible ? "ON" : "OFF",
 				rendererReady ? "READY" : "WAIT",
-				crosshairEnabled ? "ON" : "OFF");
+				crosshairEnabled ? 1 : 0, watermarkEnabled ? 1 : 0,
+				fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0);
 			loggedPresent = true;
 			lastPresentLogTick = now;
 
@@ -560,7 +670,7 @@ namespace Modern126PresentProbe {
 		started = true;
 		logF("[modern] DXGI Present renderer installed Present=%llX ExecuteCommandLists=%llX",
 			presentTarget, executeTarget);
-		logF("[modern] First modern feature registered: Visuals/Crosshair");
+		logF("[modern] Modern module layer registered: Visuals/Crosshair, HUD/Watermark, HUD/FPS Counter, HUD/Module List");
 		return true;
 	}
 
