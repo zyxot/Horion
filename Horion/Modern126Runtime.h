@@ -32,8 +32,10 @@ namespace Modern126Runtime {
 	inline bool loggedFlushTextFailure = false;
 	inline uint64_t debugOverlayPassCount = 0;
 	inline uint64_t debugTextFlushCount = 0;
+	inline uint64_t totalTextFlushCount = 0;
 	inline DWORD lastDebugOverlayLogTick = 0;
 	inline uintptr_t lastDebugOverlayContext = 0;
+	inline uintptr_t latestDebugRenderContext = 0;
 	inline thread_local bool insideDebugScreenRender = false;
 	inline thread_local bool injectingTextAtFlush = false;
 	inline thread_local void* activeDebugRenderContext = nullptr;
@@ -142,8 +144,8 @@ namespace Modern126Runtime {
 		const Modern126Overlay::Color muted { 0.70f, 0.76f, 0.84f, 1.00f };
 
 		static const std::string title = "HORION FLUSHTEXT HOOK TEST";
-		static const std::string line1 = "Injected inside Bedrock text flush";
-		static const std::string line2 = "Same frame, same render context";
+		static const std::string line1 = "Injected at Bedrock text flush";
+		static const std::string line2 = "Probing outside ScreenView timing";
 		static const std::string line3 = "INSERT closes this test";
 
 		const bool ok =
@@ -168,26 +170,27 @@ namespace Modern126Runtime {
 	inline void __fastcall flushTextDetour(void* renderContext, float lastFlush, std::optional<float> optionalFlush) {
 		auto original = textFlushHook->GetFastcall<void, void*, float, std::optional<float>>();
 
+		++totalTextFlushCount;
+		const uintptr_t ctx = reinterpret_cast<uintptr_t>(renderContext);
 		const bool debugFlush = insideDebugScreenRender && renderContext == activeDebugRenderContext;
-		if (debugFlush) {
-			++debugTextFlushCount;
-			if (debugTextFlushCount <= 12) {
-				if (optionalFlush.has_value()) {
-					logF("[modern] debug_screen flushText #%llu ctx=%llX lastFlush=%.3f optional=%.3f",
-						static_cast<unsigned long long>(debugTextFlushCount),
-						reinterpret_cast<uintptr_t>(renderContext), lastFlush, optionalFlush.value());
-				} else {
-					logF("[modern] debug_screen flushText #%llu ctx=%llX lastFlush=%.3f optional=none",
-						static_cast<unsigned long long>(debugTextFlushCount),
-						reinterpret_cast<uintptr_t>(renderContext), lastFlush);
-				}
-			}
+		const bool matchesLatestDebugContext = latestDebugRenderContext != 0 && ctx == latestDebugRenderContext;
 
-			if (Modern126Overlay::visible && !injectingTextAtFlush) {
-				injectingTextAtFlush = true;
-				queueTextImmediatelyBeforeFlush(renderContext);
-				injectingTextAtFlush = false;
-			}
+		// The previous build only logged flushes while still inside the ScreenView
+		// call. This probe logs the first calls globally so we can tell whether
+		// Bedrock flushes the same render context later in the frame.
+		if (totalTextFlushCount <= 20) {
+			logF("[modern] flushText detour #%llu ctx=%llX lastFlush=%.3f insideDebug=%s matchesDebugCtx=%s",
+				static_cast<unsigned long long>(totalTextFlushCount), ctx, lastFlush,
+				debugFlush ? "YES" : "NO", matchesLatestDebugContext ? "YES" : "NO");
+		}
+
+		if (debugFlush)
+			++debugTextFlushCount;
+
+		if (Modern126Overlay::visible && (debugFlush || matchesLatestDebugContext) && !injectingTextAtFlush) {
+			injectingTextAtFlush = true;
+			queueTextImmediatelyBeforeFlush(renderContext);
+			injectingTextAtFlush = false;
 		}
 
 		// Do not call Modern126Overlay::flushTextGuarded here: that would recurse.
@@ -230,12 +233,14 @@ namespace Modern126Runtime {
 		auto original = screenViewHook->GetFastcall<void, void*, void*>();
 		const bool debugLayerBefore = isDebugScreenView(view);
 
-		if (debugLayerBefore)
+		if (debugLayerBefore) {
+			latestDebugRenderContext = reinterpret_cast<uintptr_t>(renderContext);
 			ensureTextFlushHook(renderContext);
+		}
 
 		// Mark only the duration of Minecraft's real debug_screen render. The
-		// flushText detour uses this to inject at the exact point Bedrock consumes
-		// its text batch, rather than before or after the layer lifecycle.
+		// flushText detour also remembers the latest debug context after this call,
+		// because current Bedrock may flush that context later in the frame.
 		const bool previousInsideDebug = insideDebugScreenRender;
 		void* previousDebugContext = activeDebugRenderContext;
 		if (debugLayerBefore) {
@@ -263,7 +268,7 @@ namespace Modern126Runtime {
 				const uintptr_t ctx = reinterpret_cast<uintptr_t>(renderContext);
 				const bool contextChanged = ctx != lastDebugOverlayContext;
 				if (debugOverlayPassCount <= 12 || contextChanged || (now - lastDebugOverlayLogTick) >= 1000) {
-					logF("[modern] debug_screen flush-hook overlay pass #%llu view=%llX ctx=%llX contextChanged=%s",
+					logF("[modern] debug_screen global-flush probe pass #%llu view=%llX ctx=%llX contextChanged=%s",
 						static_cast<unsigned long long>(debugOverlayPassCount),
 						reinterpret_cast<uintptr_t>(view), ctx, contextChanged ? "YES" : "NO");
 					lastDebugOverlayLogTick = now;
@@ -314,7 +319,6 @@ namespace Modern126Runtime {
 					logF("[modern] CTRL+L requested unload");
 					isRunning = false;
 					break;
-				}
 			}
 			Sleep(5);
 		}
