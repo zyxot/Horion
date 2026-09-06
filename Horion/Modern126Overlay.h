@@ -13,6 +13,7 @@ namespace Modern126Overlay {
 	inline bool loggedText = false;
 	inline bool loggedTextFailure = false;
 	inline bool loggedGuiScale = false;
+	inline bool loggedFontInfo = false;
 
 	struct RectangleArea {
 		float left;
@@ -56,12 +57,20 @@ namespace Modern126Overlay {
 			info.AllocationBase == GetModuleHandleA("Minecraft.Windows.exe");
 	}
 
+	inline bool readableAddress(uintptr_t address) {
+		if (address == 0)
+			return false;
+		MEMORY_BASIC_INFORMATION info = {};
+		if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info))
+			return false;
+		if (info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+			return false;
+		return true;
+	}
+
 	// Current GuiData layout on the verified 1.26.45.1 build:
 	//   +0x5C guiScale
 	//   +0x60 guiScaleFrac (1 / guiScale)
-	// MinecraftUIRenderContext consumes GUI-space coordinates, so use the
-	// reciprocal scale to keep this test panel roughly the same physical size
-	// regardless of the user's Minecraft GUI scale.
 	inline float getGuiScaleFracGuarded(void* guiData) {
 		if (guiData == nullptr)
 			return 1.f;
@@ -95,24 +104,83 @@ namespace Modern126Overlay {
 		}
 	}
 
-	// Keep the SEH frame in a helper that owns no std::string object. That avoids
-	// MSVC C2712 while still protecting the 1.26 drawDebugText experiment.
-	inline bool drawDebugTextGuarded(void* renderContext, const RectangleArea& rect,
-		const std::string& text, const Color& color, float alpha) {
-		if (renderContext == nullptr)
+	// MinecraftGame +0x700 holds the current FontRepository pointer. The
+	// maintained 1.26 client exposes its smooth font as fontList[7]. Read the
+	// release-mode vector storage directly so this small bridge does not need to
+	// import the newer SDK's FontRepository class yet.
+	inline void* resolveFontGuarded(void* minecraftGame) {
+		if (minecraftGame == nullptr)
+			return nullptr;
+
+		__try {
+			const uintptr_t repo = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x700);
+			if (!readableAddress(repo + 0x40))
+				return nullptr;
+
+			// MSVC release std::vector begins with begin/end/capacity pointers.
+			const uintptr_t begin = *reinterpret_cast<uintptr_t*>(repo + 0x40);
+			const uintptr_t end = *reinterpret_cast<uintptr_t*>(repo + 0x48);
+			if (begin == 0 || end < begin || !readableAddress(begin))
+				return nullptr;
+
+			// std::shared_ptr is two pointers in this build: object + control block.
+			constexpr size_t sharedPtrSize = sizeof(uintptr_t) * 2;
+			const size_t count = static_cast<size_t>((end - begin) / sharedPtrSize);
+			if (count <= 7)
+				return nullptr;
+
+			void* font = *reinterpret_cast<void**>(begin + (7 * sharedPtrSize));
+			return readableAddress(reinterpret_cast<uintptr_t>(font)) ? font : nullptr;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	inline float getFontLineHeightGuarded(void* font) {
+		if (font == nullptr)
+			return 10.f;
+
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(font);
+			if (vtable == nullptr || !addressInMinecraft(vtable[0x7]))
+				return 10.f;
+			using GetLineHeightFn = float(__fastcall*)(void*);
+			const float height = reinterpret_cast<GetLineHeightFn>(vtable[0x7])(font);
+			return (height >= 1.f && height <= 100.f) ? height : 10.f;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return 10.f;
+		}
+	}
+
+	// Use MinecraftUIRenderContext::drawText (slot 0x5) with an actual Font.
+	// Current Bedrock computes TextMeasureData as roughly
+	//   (requestedSize * guiScaleFrac) / fontLineHeight
+	// so the previous debug-text value of 8.0 was dramatically oversized.
+	inline bool drawTextGuarded(void* renderContext, void* font, const RectangleArea& rect,
+		const std::string& text, const Color& color, float alpha, float requestedSize,
+		float guiScaleFrac, float fontLineHeight) {
+		if (renderContext == nullptr || font == nullptr)
 			return false;
 
 		__try {
 			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
-			if (vtable == nullptr || !addressInMinecraft(vtable[0x4]))
+			if (vtable == nullptr || !addressInMinecraft(vtable[0x5]))
 				return false;
 
-			const TextMeasureData measure { 8.0f, 0.f, true, false, false };
+			float measureSize = (requestedSize * guiScaleFrac) / fontLineHeight;
+			if (measureSize < 0.05f)
+				measureSize = 0.05f;
+			if (measureSize > 4.f)
+				measureSize = 4.f;
+
+			const TextMeasureData measure { measureSize, 0.f, true, false, false };
 			const CaretMeasureData caret { -1, false };
-			using DrawDebugTextFn = void(__fastcall*)(void*, const RectangleArea&, const std::string&,
+			using DrawTextFn = void(__fastcall*)(void*, void*, const RectangleArea&, const std::string&,
 				const Color&, float, TextAlignment, const TextMeasureData&, const CaretMeasureData&);
-			auto fn = reinterpret_cast<DrawDebugTextFn>(vtable[0x4]);
-			fn(renderContext, rect, text, color, alpha, TextAlignment::LEFT, measure, caret);
+			auto fn = reinterpret_cast<DrawTextFn>(vtable[0x5]);
+			fn(renderContext, font, rect, text, color, alpha, TextAlignment::LEFT, measure, caret);
 			return true;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -120,10 +188,6 @@ namespace Modern126Overlay {
 		}
 	}
 
-	// Current Bedrock queues MinecraftUIRenderContext text and then flushes it.
-	// The maintained 1.26 renderer calls vtable slot 0x6 with a float and an
-	// empty optional<float>. Without this flush, drawDebugText can return normally
-	// while producing no visible pixels -- exactly what the previous test showed.
 	inline bool flushTextGuarded(void* renderContext) {
 		if (renderContext == nullptr)
 			return false;
@@ -148,7 +212,7 @@ namespace Modern126Overlay {
 		logF("[modern] INSERT toggled test menu %s", visible ? "ON" : "OFF");
 	}
 
-	inline void render(void* renderContext, void* guiData) {
+	inline void render(void* renderContext, void* guiData, void* minecraftGame) {
 		if (!visible || renderContext == nullptr)
 			return;
 
@@ -186,28 +250,44 @@ namespace Modern126Overlay {
 		if (!textEnabled)
 			return;
 
+		void* font = resolveFontGuarded(minecraftGame);
+		if (font == nullptr) {
+			textEnabled = false;
+			if (!loggedTextFailure) {
+				loggedTextFailure = true;
+				logF("[modern] Normal drawText disabled: current FontRepository font could not be resolved");
+			}
+			return;
+		}
+
+		const float lineHeight = getFontLineHeightGuarded(font);
+		if (!loggedFontInfo) {
+			loggedFontInfo = true;
+			logF("[modern] Normal text font=%llX lineHeight=%.3f", reinterpret_cast<uintptr_t>(font), lineHeight);
+		}
+
 		static const std::string title = "Horion 1.26";
 		static const std::string line1 = "Modern runtime bridge";
 		static const std::string line2 = "Render + input verified";
 		static const std::string line3 = "INSERT closes this menu";
 
 		const bool textCallsOk =
-			drawDebugTextGuarded(renderContext, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f) &&
-			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f) &&
-			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f) &&
-			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f);
+			drawTextGuarded(renderContext, font, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f, 11.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f, 10.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f, 10.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f, 10.f, scale, lineHeight);
 		const bool textOk = textCallsOk && flushTextGuarded(renderContext);
 
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] 1.26 drawDebugText + flushText completed; check text visibility");
+				logF("[modern] 1.26 normal drawText + FontRepository + flushText completed");
 			}
 		} else {
 			textEnabled = false;
 			if (!loggedTextFailure) {
 				loggedTextFailure = true;
-				logF("[modern] 1.26 text queue/flush failed and was disabled; rectangle menu remains active");
+				logF("[modern] Normal drawText path failed and was disabled; rectangle menu remains active");
 			}
 		}
 	}
