@@ -282,24 +282,14 @@ namespace Modern126Overlay {
 			return RectangleArea { left * scale, right * scale, top * scale, bottom * scale };
 		};
 
-		const Color panel { 0.055f, 0.065f, 0.085f, 0.94f };
-		const Color header { 0.10f, 0.65f, 1.00f, 0.95f };
-		const Color row { 0.10f, 0.115f, 0.145f, 0.92f };
+		// Diagnostic pass: intentionally draw no rectangles. If text now remains
+		// visible, the rectangle batch/flush path was covering the text afterward.
 		const Color text { 0.95f, 0.97f, 1.00f, 1.00f };
 		const Color muted { 0.70f, 0.76f, 0.84f, 1.00f };
 
-		const bool panelOk =
-			fillRectangleGuarded(renderContext, scaledRect(24.f, 324.f, 24.f, 214.f), panel) &&
-			fillRectangleGuarded(renderContext, scaledRect(24.f, 324.f, 24.f, 58.f), header) &&
-			fillRectangleGuarded(renderContext, scaledRect(38.f, 310.f, 78.f, 112.f), row) &&
-			fillRectangleGuarded(renderContext, scaledRect(38.f, 310.f, 122.f, 156.f), row) &&
-			fillRectangleGuarded(renderContext, scaledRect(38.f, 310.f, 166.f, 200.f), row);
-		if (!panelOk)
-			return;
-
 		if (!loggedVisible) {
 			loggedVisible = true;
-			logF("[modern] INSERT test menu rendered successfully");
+			logF("[modern] Text-only overlay test entered; rectangle drawing is disabled");
 		}
 		if (!textEnabled)
 			return;
@@ -337,10 +327,10 @@ namespace Modern126Overlay {
 				previousTextAlpha);
 		}
 
-		static const std::string title = "Horion 1.26";
+		static const std::string title = "HORION TEXT-ONLY TEST";
 		static const std::string line1 = "Modern runtime bridge";
-		static const std::string line2 = "Render + input verified";
-		static const std::string line3 = "INSERT closes this menu";
+		static const std::string line2 = "No rectangle draw calls";
+		static const std::string line3 = "INSERT closes this test";
 
 		const bool textCallsOk =
 			drawTextGuarded(renderContext, font, scaledRect(30.f, 318.f, 24.f, 58.f), title, text, 32.f, scale, lineHeight) &&
@@ -355,13 +345,13 @@ namespace Modern126Overlay {
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] 1.26 drawText using DefaultFont/current text alpha + flushText completed");
+				logF("[modern] Text-only drawText + flushText completed; no rectangles were submitted");
 			}
 		} else {
 			textEnabled = false;
 			if (!loggedTextFailure) {
 				loggedTextFailure = true;
-				logF("[modern] Normal drawText path failed and was disabled; rectangle menu remains active");
+				logF("[modern] Text-only drawText path failed and was disabled");
 			}
 		}
 	}
