@@ -18,10 +18,6 @@ namespace Modern126Gameplay {
 	inline void* clientInstance = nullptr;
 	inline int* keyMap = nullptr;
 
-	// Current 1.26 actor component layout used by the maintained client:
-	// LocalPlayer +0x218 -> StateVectorComponent { pos, posOld, velocity }
-	// LocalPlayer +0x228 -> ActorRotationComponent { rotation, rotationOld }
-	// Keep local POD mirrors here so the archived 1.18 SDK stays out of this path.
 	struct Vec2Lite {
 		float x;
 		float y;
@@ -33,6 +29,9 @@ namespace Modern126Gameplay {
 		float z;
 	};
 
+	// Current 1.26 actor component layout used by the maintained client:
+	// LocalPlayer +0x218 -> StateVectorComponent { pos, posOld, velocity }
+	// LocalPlayer +0x228 -> ActorRotationComponent { rotation, rotationOld }
 	struct StateVectorLite {
 		Vec3Lite pos;
 		Vec3Lite posOld;
@@ -65,6 +64,14 @@ namespace Modern126Gameplay {
 		const uintptr_t end = begin + requiredBytes;
 		const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
 		return end >= begin && end <= regionEnd;
+	}
+
+	inline bool isAutoSprintEnabled() {
+		return autoSprintEnabled;
+	}
+
+	inline bool isFlyEnabled() {
+		return flyEnabled;
 	}
 
 	inline void setAutoSprintEnabled(bool enabled) {
@@ -110,8 +117,6 @@ namespace Modern126Gameplay {
 				!std::isfinite(state->velocity.x) || !std::isfinite(state->velocity.y) || !std::isfinite(state->velocity.z) ||
 				!std::isfinite(rotation->rotation.x) || !std::isfinite(rotation->rotation.y))
 				return false;
-
-			// Bedrock yaw is expected to stay within a small multiple of 360 degrees.
 			if (std::fabs(rotation->rotation.y) > 10000.0f)
 				return false;
 
@@ -145,7 +150,11 @@ namespace Modern126Gameplay {
 		if (!enabled)
 			releaseFlyVelocity();
 		flyEnabled = enabled;
-		logF("[modern] Movement/Fly state=%s", enabled ? "ON" : "OFF");
+		loggedFlyFailure = false;
+		if (enabled)
+			logF("[modern] Movement/Fly state=ON; close the INSERT menu to control flight");
+		else
+			logF("[modern] Movement/Fly state=OFF");
 	}
 
 	inline void toggleFly() {
@@ -155,10 +164,6 @@ namespace Modern126Gameplay {
 	inline void tickAutoSprint(void* localPlayer) {
 		if (!autoSprintEnabled || localPlayer == nullptr || keyMap == nullptr || Modern126Overlay::visible)
 			return;
-
-		// First gameplay canary uses the already-validated current KeyMap rather
-		// than touching the newer ECS MoveInputComponent layout. Only force sprint
-		// while the normal forward key is physically held.
 		if (keyMap['W'] == 0)
 			return;
 
@@ -180,8 +185,7 @@ namespace Modern126Gameplay {
 
 			if (!loggedAutoSprintReady) {
 				loggedAutoSprintReady = true;
-				logF("[modern] AutoSprint runtime call validated slot=0x8B target=%llX",
-					vtable[0x8B]);
+				logF("[modern] AutoSprint runtime call validated slot=0x8B target=%llX", vtable[0x8B]);
 			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -230,9 +234,10 @@ namespace Modern126Gameplay {
 				wishZ /= horizontal;
 			}
 
-			// Conservative first-pass speed. This only writes the local StateVector;
-			// no packet spoofing, server correction bypass, or anti-cheat handling.
-			constexpr float flySpeed = 0.35f;
+			// Apply after MinecraftGame::_update so normal physics does not immediately
+			// overwrite the canary velocity. This remains local/offline compatibility
+			// work: no packet spoofing or server-correction bypass is performed.
+			constexpr float flySpeed = 0.45f;
 			state->velocity.x = wishX * flySpeed;
 			state->velocity.y = vertical * flySpeed;
 			state->velocity.z = wishZ * flySpeed;
@@ -253,8 +258,18 @@ namespace Modern126Gameplay {
 		}
 	}
 
+	// Called from the validated MinecraftGame::_update detour, after the original
+	// game update. Keeping gameplay writes synchronized to that hook makes motion
+	// deterministic compared with racing Minecraft from the hotkey thread.
+	inline void tickFromGameUpdate(void* localPlayer) {
+		if (!started)
+			return;
+		tickAutoSprint(localPlayer);
+		tickFly(localPlayer);
+	}
+
 	inline DWORD WINAPI featureThread(LPVOID) {
-		logF("[modern] Gameplay canary thread started; F6=AutoSprint F7=Fly");
+		logF("[modern] Gameplay hotkey thread started; F6=AutoSprint F7=Fly");
 		bool f6WasDown = false;
 		bool f7WasDown = false;
 		while (isRunning && started) {
@@ -269,13 +284,9 @@ namespace Modern126Gameplay {
 					toggleFly();
 				f7WasDown = f7Down;
 			}
-
-			void* localPlayer = refreshLocalPlayer();
-			tickAutoSprint(localPlayer);
-			tickFly(localPlayer);
 			Sleep(5);
 		}
-		logF("[modern] Gameplay canary thread stopped");
+		logF("[modern] Gameplay hotkey thread stopped");
 		return 0;
 	}
 
@@ -295,11 +306,11 @@ namespace Modern126Gameplay {
 			started = false;
 			clientInstance = nullptr;
 			keyMap = nullptr;
-			logF("[modern] Gameplay canary thread creation failed error=%lu", GetLastError());
+			logF("[modern] Gameplay hotkey thread creation failed error=%lu", GetLastError());
 			return false;
 		}
 		CloseHandle(thread);
-		logF("[modern] Gameplay bridge armed; AutoSprint=F6 Fly=F7 thread=%lu", threadId);
+		logF("[modern] Gameplay bridge armed; GUI + F6 AutoSprint + F7 Fly thread=%lu", threadId);
 		return true;
 	}
 
