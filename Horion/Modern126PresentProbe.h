@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Modern126Gameplay.h"
+#include "Modern126Visuals.h"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -64,6 +65,8 @@ namespace Modern126PresentProbe {
 
 	// Renderer/HUD modules.
 	inline bool crosshairEnabled = false;
+	inline bool espEnabled = false;
+	inline bool blockEspEnabled = false;
 	inline bool watermarkEnabled = false;
 	inline bool fpsEnabled = false;
 	inline bool moduleListEnabled = false;
@@ -80,7 +83,7 @@ namespace Modern126PresentProbe {
 	}
 
 	inline bool anyPersistentFeatureEnabled() {
-		return crosshairEnabled || watermarkEnabled || fpsEnabled || moduleListEnabled;
+		return crosshairEnabled || espEnabled || blockEspEnabled || watermarkEnabled || fpsEnabled || moduleListEnabled;
 	}
 
 	inline void tickFps() {
@@ -392,6 +395,8 @@ namespace Modern126PresentProbe {
 		};
 
 		if (crosshairEnabled) drawEntry(L"Crosshair");
+		if (espEnabled) drawEntry(L"ESP");
+		if (blockEspEnabled) drawEntry(L"Block ESP");
 		if (watermarkEnabled) drawEntry(L"Watermark");
 		if (fpsEnabled) drawEntry(L"FPS Counter");
 		if (moduleListEnabled) drawEntry(L"Module List");
@@ -423,6 +428,8 @@ namespace Modern126PresentProbe {
 		}
 
 		const D2D1_RECT_F crosshairButton = { 38.0f, 116.0f, 286.0f, 157.0f };
+		const D2D1_RECT_F espButton = { 38.0f, 168.0f, 286.0f, 209.0f };
+		const D2D1_RECT_F blockEspButton = { 38.0f, 220.0f, 286.0f, 261.0f };
 		const D2D1_RECT_F watermarkButton = { 318.0f, 116.0f, 566.0f, 157.0f };
 		const D2D1_RECT_F fpsButton = { 318.0f, 168.0f, 566.0f, 209.0f };
 		const D2D1_RECT_F moduleListButton = { 318.0f, 220.0f, 566.0f, 261.0f };
@@ -430,6 +437,8 @@ namespace Modern126PresentProbe {
 		const D2D1_RECT_F flyButton = { 598.0f, 168.0f, 846.0f, 209.0f };
 
 		bool hoverCrosshair = false;
+		bool hoverEsp = false;
+		bool hoverBlockEsp = false;
 		bool hoverWatermark = false;
 		bool hoverFps = false;
 		bool hoverModuleList = false;
@@ -439,6 +448,8 @@ namespace Modern126PresentProbe {
 		if (Modern126Overlay::visible) {
 			updateMouse();
 			hoverCrosshair = mouseValid && pointInside(mouseClient, crosshairButton);
+			hoverEsp = mouseValid && pointInside(mouseClient, espButton);
+			hoverBlockEsp = mouseValid && pointInside(mouseClient, blockEspButton);
 			hoverWatermark = mouseValid && pointInside(mouseClient, watermarkButton);
 			hoverFps = mouseValid && pointInside(mouseClient, fpsButton);
 			hoverModuleList = mouseValid && pointInside(mouseClient, moduleListButton);
@@ -450,6 +461,12 @@ namespace Modern126PresentProbe {
 				if (hoverCrosshair) {
 					crosshairEnabled = !crosshairEnabled;
 					logFeatureToggle("Visuals/Crosshair", crosshairEnabled);
+				} else if (hoverEsp) {
+					espEnabled = !espEnabled;
+					logFeatureToggle("Visuals/ESP", espEnabled);
+				} else if (hoverBlockEsp) {
+					blockEspEnabled = !blockEspEnabled;
+					logFeatureToggle("Visuals/BlockESP", blockEspEnabled);
 				} else if (hoverWatermark) {
 					watermarkEnabled = !watermarkEnabled;
 					logFeatureToggle("HUD/Watermark", watermarkEnabled);
@@ -475,6 +492,8 @@ namespace Modern126PresentProbe {
 		bridge11On12->AcquireWrappedResources(&wrapped, 1);
 		d2dContext->SetTarget(d2dTargets[index]);
 		d2dContext->BeginDraw();
+
+		Modern126Visuals::render(d2dContext, d2dTargets[index], hoverBrush, activeBrush, espEnabled, blockEspEnabled);
 
 		if (Modern126Overlay::visible) {
 			const D2D1_RECT_F panel = { 24.0f, 24.0f, 860.0f, 318.0f };
@@ -505,6 +524,8 @@ namespace Modern126PresentProbe {
 			};
 
 			drawToggle(crosshairButton, crosshairEnabled, hoverCrosshair, L"CROSSHAIR: ON", L"CROSSHAIR: OFF");
+			drawToggle(espButton, espEnabled, hoverEsp, L"ESP: ON", L"ESP: OFF");
+			drawToggle(blockEspButton, blockEspEnabled, hoverBlockEsp, L"BLOCK ESP: ON", L"BLOCK ESP: OFF");
 			drawToggle(watermarkButton, watermarkEnabled, hoverWatermark, L"WATERMARK: ON", L"WATERMARK: OFF");
 			drawToggle(fpsButton, fpsEnabled, hoverFps, L"FPS COUNTER: ON", L"FPS COUNTER: OFF");
 			drawToggle(moduleListButton, moduleListEnabled, hoverModuleList, L"MODULE LIST: ON", L"MODULE LIST: OFF");
@@ -513,7 +534,7 @@ namespace Modern126PresentProbe {
 			drawToggle(flyButton, Modern126Gameplay::isFlyEnabled(), hoverFly,
 				L"FLY: ON", L"FLY: OFF");
 
-			static const wchar_t note[] = L"Fly controls: close menu, then WASD + Space/Shift";
+			static const wchar_t note[] = L"Block ESP preset: diamond / emerald / gold / ancient debris (12-block radius)";
 			static const wchar_t footer[] = L"INSERT closes menu   |   F6 AutoSprint   |   F7 Fly   |   CTRL+L unloads";
 			const D2D1_RECT_F noteRect = { 38.0f, 270.0f, 850.0f, 292.0f };
 			const D2D1_RECT_F footerRect = { 38.0f, 292.0f, 850.0f, 314.0f };
@@ -539,7 +560,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D feature UI rendered successfully; Visuals + HUD + Movement ready");
+			logF("[modern] Present Direct2D feature UI rendered successfully; ESP + BlockESP + HUD + Movement ready");
 		}
 	}
 
@@ -560,14 +581,14 @@ namespace Modern126PresentProbe {
 
 			const char* api = SUCCEEDED(hr12) && device12 != nullptr ? "DX12" :
 				(SUCCEEDED(hr11) && device11 != nullptr ? "DX11" : "UNKNOWN");
-			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/W%d/F%d/L%d AS%d/FL%d",
+			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/E%d/B%d/W%d/F%d/L%d AS%d/FL%d",
 				static_cast<unsigned long long>(presentCount),
 				reinterpret_cast<uintptr_t>(chain), api,
 				reinterpret_cast<uintptr_t>(capturedCommandQueue),
 				Modern126Overlay::visible ? "ON" : "OFF",
 				rendererReady ? "READY" : "WAIT",
-				crosshairEnabled ? 1 : 0, watermarkEnabled ? 1 : 0,
-				fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0,
+				crosshairEnabled ? 1 : 0, espEnabled ? 1 : 0, blockEspEnabled ? 1 : 0,
+				watermarkEnabled ? 1 : 0, fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0,
 				Modern126Gameplay::isAutoSprintEnabled() ? 1 : 0,
 				Modern126Gameplay::isFlyEnabled() ? 1 : 0);
 			loggedPresent = true;
@@ -694,7 +715,7 @@ namespace Modern126PresentProbe {
 		started = true;
 		logF("[modern] DXGI Present renderer installed Present=%llX ExecuteCommandLists=%llX",
 			presentTarget, executeTarget);
-		logF("[modern] Modern module layer registered: Visuals/Crosshair, HUD/Watermark/FPS/ModuleList, Movement/AutoSprint/Fly");
+		logF("[modern] Modern module layer registered: Visuals/Crosshair/ESP/BlockESP, HUD/Watermark/FPS/ModuleList, Movement/AutoSprint/Fly");
 		return true;
 	}
 
@@ -705,6 +726,7 @@ namespace Modern126PresentProbe {
 			executeCommandListsHook->enableHook(false);
 		presentHook.reset();
 		executeCommandListsHook.reset();
+		Modern126Visuals::shutdown();
 		releaseRenderer();
 		releaseCapturedQueue();
 		started = false;
