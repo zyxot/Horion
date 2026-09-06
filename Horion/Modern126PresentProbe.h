@@ -68,6 +68,7 @@ namespace Modern126PresentProbe {
 		if (value != nullptr) {
 			value->Release();
 			value = nullptr;
+		}
 	}
 
 	inline void releaseRenderer() {
