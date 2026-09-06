@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 // Tiny 1.26.45.1 overlay used only to prove current UI rendering + KeyMap input
@@ -106,16 +107,35 @@ namespace Modern126Overlay {
 			if (vtable == nullptr || !addressInMinecraft(vtable[0x4]))
 				return false;
 
-			// The previous 1.0 value was far below the scale used by current Bedrock
-			// UI text. The maintained 1.26 layout defaults TextMeasureData to 10.0;
-			// use 8.0 here so the canary text is visibly sized without dominating the
-			// small panel.
 			const TextMeasureData measure { 8.0f, 0.f, true, false, false };
 			const CaretMeasureData caret { -1, false };
 			using DrawDebugTextFn = void(__fastcall*)(void*, const RectangleArea&, const std::string&,
 				const Color&, float, TextAlignment, const TextMeasureData&, const CaretMeasureData&);
 			auto fn = reinterpret_cast<DrawDebugTextFn>(vtable[0x4]);
 			fn(renderContext, rect, text, color, alpha, TextAlignment::LEFT, measure, caret);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Current Bedrock queues MinecraftUIRenderContext text and then flushes it.
+	// The maintained 1.26 renderer calls vtable slot 0x6 with a float and an
+	// empty optional<float>. Without this flush, drawDebugText can return normally
+	// while producing no visible pixels -- exactly what the previous test showed.
+	inline bool flushTextGuarded(void* renderContext) {
+		if (renderContext == nullptr)
+			return false;
+
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			if (vtable == nullptr || !addressInMinecraft(vtable[0x6]))
+				return false;
+
+			using FlushTextFn = void(__fastcall*)(void*, float, std::optional<float>);
+			auto fn = reinterpret_cast<FlushTextFn>(vtable[0x6]);
+			fn(renderContext, 0.f, std::optional<float> {});
 			return true;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -171,22 +191,23 @@ namespace Modern126Overlay {
 		static const std::string line2 = "Render + input verified";
 		static const std::string line3 = "INSERT closes this menu";
 
-		const bool textOk =
+		const bool textCallsOk =
 			drawDebugTextGuarded(renderContext, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f) &&
 			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f) &&
 			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f) &&
 			drawDebugTextGuarded(renderContext, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f);
+		const bool textOk = textCallsOk && flushTextGuarded(renderContext);
 
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] 1.26 drawDebugText calls completed; visual confirmation still required");
+				logF("[modern] 1.26 drawDebugText + flushText completed; check text visibility");
 			}
 		} else {
 			textEnabled = false;
 			if (!loggedTextFailure) {
 				loggedTextFailure = true;
-				logF("[modern] drawDebugText test failed and was disabled; rectangle menu remains active");
+				logF("[modern] 1.26 text queue/flush failed and was disabled; rectangle menu remains active");
 			}
 		}
 	}
