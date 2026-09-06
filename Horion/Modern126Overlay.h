@@ -266,8 +266,10 @@ namespace Modern126Overlay {
 		if (!loggedFontInfo) {
 			loggedFontInfo = true;
 			const float bodyMeasure = (30.f * scale) / lineHeight;
-			logF("[modern] Normal text font=%llX lineHeight=%.3f bodyMeasure=%.3f",
-				reinterpret_cast<uintptr_t>(font), lineHeight, bodyMeasure);
+			const float renderedBodyHeight = lineHeight * bodyMeasure;
+			const float rowHeight = (112.f - 78.f) * scale;
+			logF("[modern] Normal text font=%llX lineHeight=%.3f bodyMeasure=%.3f renderedHeight=%.3f rowHeight=%.3f",
+				reinterpret_cast<uintptr_t>(font), lineHeight, bodyMeasure, renderedBodyHeight, rowHeight);
 		}
 
 		static const std::string title = "Horion 1.26";
@@ -275,17 +277,21 @@ namespace Modern126Overlay {
 		static const std::string line2 = "Render + input verified";
 		static const std::string line3 = "INSERT closes this menu";
 
+		// Use the full header/row heights for text clipping. The previous 22px
+		// unscaled text rectangles became only 5.5 UI units at guiScaleFrac=0.25,
+		// while a normal 30px Bedrock font renders ~7.5 UI units tall. That meant
+		// drawText succeeded but its glyphs were clipped away.
 		const bool textCallsOk =
-			drawTextGuarded(renderContext, font, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f, 36.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f, 30.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f, 30.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f, 30.f, scale, lineHeight);
+			drawTextGuarded(renderContext, font, scaledRect(30.f, 318.f, 24.f, 58.f), title, text, 1.f, 32.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 78.f, 112.f), line1, text, 1.f, 30.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 122.f, 156.f), line2, text, 1.f, 30.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 166.f, 200.f), line3, muted, 1.f, 30.f, scale, lineHeight);
 		const bool textOk = textCallsOk && flushTextGuarded(renderContext);
 
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] 1.26 normal drawText at Bedrock UI scale + flushText completed");
+				logF("[modern] 1.26 normal drawText with unclipped row bounds + flushText completed");
 			}
 		} else {
 			textEnabled = false;
