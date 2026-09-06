@@ -155,9 +155,11 @@ namespace Modern126Overlay {
 	}
 
 	// Use MinecraftUIRenderContext::drawText (slot 0x5) with an actual Font.
-	// Current Bedrock computes TextMeasureData as roughly
+	// The maintained current renderer computes TextMeasureData as:
 	//   (requestedSize * guiScaleFrac) / fontLineHeight
-	// so the previous debug-text value of 8.0 was dramatically oversized.
+	// Its DrawUtil defaults to a requested size of 30, so use that same scale for
+	// the body text rather than the earlier 10px canary. On the user's 4x GUI
+	// scale (guiScaleFrac=0.25, lineHeight=7.5), 30 becomes a normal measure of 1.0.
 	inline bool drawTextGuarded(void* renderContext, void* font, const RectangleArea& rect,
 		const std::string& text, const Color& color, float alpha, float requestedSize,
 		float guiScaleFrac, float fontLineHeight) {
@@ -263,7 +265,9 @@ namespace Modern126Overlay {
 		const float lineHeight = getFontLineHeightGuarded(font);
 		if (!loggedFontInfo) {
 			loggedFontInfo = true;
-			logF("[modern] Normal text font=%llX lineHeight=%.3f", reinterpret_cast<uintptr_t>(font), lineHeight);
+			const float bodyMeasure = (30.f * scale) / lineHeight;
+			logF("[modern] Normal text font=%llX lineHeight=%.3f bodyMeasure=%.3f",
+				reinterpret_cast<uintptr_t>(font), lineHeight, bodyMeasure);
 		}
 
 		static const std::string title = "Horion 1.26";
@@ -272,16 +276,16 @@ namespace Modern126Overlay {
 		static const std::string line3 = "INSERT closes this menu";
 
 		const bool textCallsOk =
-			drawTextGuarded(renderContext, font, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f, 11.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f, 10.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f, 10.f, scale, lineHeight) &&
-			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f, 10.f, scale, lineHeight);
+			drawTextGuarded(renderContext, font, scaledRect(38.f, 310.f, 31.f, 53.f), title, text, 1.f, 36.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 84.f, 106.f), line1, text, 1.f, 30.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 128.f, 150.f), line2, text, 1.f, 30.f, scale, lineHeight) &&
+			drawTextGuarded(renderContext, font, scaledRect(48.f, 300.f, 172.f, 194.f), line3, muted, 1.f, 30.f, scale, lineHeight);
 		const bool textOk = textCallsOk && flushTextGuarded(renderContext);
 
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] 1.26 normal drawText + FontRepository + flushText completed");
+				logF("[modern] 1.26 normal drawText at Bedrock UI scale + flushText completed");
 			}
 		} else {
 			textEnabled = false;
