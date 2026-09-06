@@ -2,6 +2,7 @@
 
 #include "Modern126Gameplay.h"
 #include "Modern126Visuals.h"
+#include "Modern126Extras.h"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -83,7 +84,8 @@ namespace Modern126PresentProbe {
 	}
 
 	inline bool anyPersistentFeatureEnabled() {
-		return crosshairEnabled || espEnabled || blockEspEnabled || watermarkEnabled || fpsEnabled || moduleListEnabled;
+		return crosshairEnabled || espEnabled || blockEspEnabled || watermarkEnabled || fpsEnabled ||
+			moduleListEnabled || Modern126Extras::anyEnabled();
 	}
 
 	inline void tickFps() {
@@ -397,9 +399,13 @@ namespace Modern126PresentProbe {
 		if (crosshairEnabled) drawEntry(L"Crosshair");
 		if (espEnabled) drawEntry(L"ESP");
 		if (blockEspEnabled) drawEntry(L"Block ESP");
+		if (Modern126Extras::tracersEnabled) drawEntry(L"Tracers");
 		if (watermarkEnabled) drawEntry(L"Watermark");
 		if (fpsEnabled) drawEntry(L"FPS Counter");
 		if (moduleListEnabled) drawEntry(L"Module List");
+		if (Modern126Extras::coordinatesEnabled) drawEntry(L"Coordinates");
+		if (Modern126Extras::speedEnabled) drawEntry(L"Speed");
+		if (Modern126Extras::directionEnabled) drawEntry(L"Direction");
 		if (Modern126Gameplay::isAutoSprintEnabled()) drawEntry(L"AutoSprint");
 		if (Modern126Gameplay::isFlyEnabled()) drawEntry(L"Fly");
 	}
@@ -494,6 +500,7 @@ namespace Modern126PresentProbe {
 		d2dContext->BeginDraw();
 
 		Modern126Visuals::render(d2dContext, d2dTargets[index], hoverBrush, activeBrush, espEnabled, blockEspEnabled);
+		Modern126Extras::render(d2dContext, d2dTargets[index], bodyFormat, panelBrush, hoverBrush, textBrush);
 
 		if (Modern126Overlay::visible) {
 			const D2D1_RECT_F panel = { 24.0f, 24.0f, 860.0f, 318.0f };
@@ -542,6 +549,9 @@ namespace Modern126PresentProbe {
 			d2dContext->DrawText(footer, _countof(footer) - 1, bodyFormat, footerRect, textBrush);
 		}
 
+		Modern126Extras::drawMenu(d2dContext, titleFormat, bodyFormat, panelBrush, headerBrush,
+			hoverBrush, activeBrush, textBrush, mouseClient, mouseValid, Modern126Overlay::visible);
+
 		drawCrosshair(d2dTargets[index]);
 		drawWatermark();
 		drawFps();
@@ -560,7 +570,7 @@ namespace Modern126PresentProbe {
 
 		if (!loggedFirstDraw) {
 			loggedFirstDraw = true;
-			logF("[modern] Present Direct2D feature UI rendered successfully; ESP + BlockESP + HUD + Movement ready");
+			logF("[modern] Present Direct2D feature UI rendered successfully; Visuals + HUD + Movement ready");
 		}
 	}
 
@@ -581,14 +591,18 @@ namespace Modern126PresentProbe {
 
 			const char* api = SUCCEEDED(hr12) && device12 != nullptr ? "DX12" :
 				(SUCCEEDED(hr11) && device11 != nullptr ? "DX11" : "UNKNOWN");
-			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/E%d/B%d/W%d/F%d/L%d AS%d/FL%d",
+			logF("[modern] DXGI Present #%llu chain=%llX api=%s queue=%llX menu=%s d2d=%s features=C%d/E%d/B%d/T%d W%d/F%d/L%d/XYZ%d/SPD%d/DIR%d AS%d/FL%d",
 				static_cast<unsigned long long>(presentCount),
 				reinterpret_cast<uintptr_t>(chain), api,
 				reinterpret_cast<uintptr_t>(capturedCommandQueue),
 				Modern126Overlay::visible ? "ON" : "OFF",
 				rendererReady ? "READY" : "WAIT",
 				crosshairEnabled ? 1 : 0, espEnabled ? 1 : 0, blockEspEnabled ? 1 : 0,
+				Modern126Extras::tracersEnabled ? 1 : 0,
 				watermarkEnabled ? 1 : 0, fpsEnabled ? 1 : 0, moduleListEnabled ? 1 : 0,
+				Modern126Extras::coordinatesEnabled ? 1 : 0,
+				Modern126Extras::speedEnabled ? 1 : 0,
+				Modern126Extras::directionEnabled ? 1 : 0,
 				Modern126Gameplay::isAutoSprintEnabled() ? 1 : 0,
 				Modern126Gameplay::isFlyEnabled() ? 1 : 0);
 			loggedPresent = true;
@@ -715,7 +729,7 @@ namespace Modern126PresentProbe {
 		started = true;
 		logF("[modern] DXGI Present renderer installed Present=%llX ExecuteCommandLists=%llX",
 			presentTarget, executeTarget);
-		logF("[modern] Modern module layer registered: Visuals/Crosshair/ESP/BlockESP, HUD/Watermark/FPS/ModuleList, Movement/AutoSprint/Fly");
+		logF("[modern] Modern module layer registered: Visuals/Crosshair/ESP/BlockESP/Tracers, HUD/Watermark/FPS/ModuleList/Coordinates/Speed/Direction, Movement/AutoSprint/Fly");
 		return true;
 	}
 
@@ -726,6 +740,7 @@ namespace Modern126PresentProbe {
 			executeCommandListsHook->enableHook(false);
 		presentHook.reset();
 		executeCommandListsHook.reset();
+		Modern126Extras::shutdown();
 		Modern126Visuals::shutdown();
 		releaseRenderer();
 		releaseCapturedQueue();
