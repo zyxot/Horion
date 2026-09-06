@@ -6,6 +6,7 @@
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
