@@ -38,16 +38,8 @@
 
 #pragma comment(lib, "Version.lib")
 
-// Loader.cpp defines this flag. The compatibility shim uses it to stop the
-// injector-connection thread when the archived signatures no longer match the
-// running Minecraft build.
 extern bool isRunning;
 
-// Loader.cpp was written before Bedrock's large post-1.18 engine changes and
-// immediately dereferences several signature results. On a current build, a
-// missing signature can therefore turn into an access violation before Horion
-// has a chance to say what went wrong. Intercept the Loader.cpp calls to the
-// static GameData helpers so startup can fail closed and leave Minecraft alive.
 class HorionCompatGameData {
 private:
 	struct SignatureCheck {
@@ -150,12 +142,6 @@ private:
 		if (minecraftGame == nullptr)
 			return false;
 
-		// Current 1.26.4x client code stores the primary ClientInstance in a
-		// std::map<uint8_t, shared_ptr<ClientInstance>> at MinecraftGame+0x938.
-		// MSVC's release STL ABI is binary-compatible across the toolsets used by
-		// this project and the current Windows client, but this is still guarded
-		// by SEH in probeModernRuntime() so a layout mismatch cannot take Minecraft
-		// down during diagnostics.
 		using PrimaryClientMap = std::map<unsigned char, std::shared_ptr<C_ClientInstance>>;
 		auto* primaryClients = reinterpret_cast<PrimaryClientMap*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x938);
 		auto primary = primaryClients->find(0);
@@ -179,8 +165,6 @@ private:
 			return false;
 		}
 
-		// Validate the modern field layout without assigning it to Horion's old
-		// C_ClientInstance fields yet; those old offsets are from the 1.18 client.
 		void* ciMinecraftGame = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1A0);
 		void* ciMinecraft = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1A8);
 		void* ciLevelRenderer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(clientInstance) + 0x1B8);
@@ -202,8 +186,6 @@ private:
 			return false;
 		}
 
-		// Current ClientInstance vtable slot 0x1F is getLocalPlayer(). Call only
-		// after validating the object's vtable against the matched 1.26 signature.
 		auto* clientVtable = *reinterpret_cast<uintptr_t**>(clientInstance);
 		using GetLocalPlayerFn = C_LocalPlayer*(__fastcall*)(void*);
 		auto getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(clientVtable[0x1F]);
@@ -261,11 +243,6 @@ private:
 		logF("[compat] GameMode vtbl[6] buildBlock    : %llX (body sig %llX, in image %s)", actualBuildBlock, signatureBuildBlock, buildBlockInMinecraft ? "YES" : "NO");
 		logF("[compat] GameMode vtbl[14] attack        : %llX (body sig %llX, in image %s)", actualAttack, signatureAttack, attackInMinecraft ? "YES" : "NO");
 
-		// The current vtable entries are small dispatch/thunk functions and do not
-		// necessarily equal the larger implementation bodies matched by the
-		// standalone attack/buildBlock signatures. The object relationship is the
-		// stronger runtime proof: GameMode must point back to this LocalPlayer and
-		// its vtable/virtual targets must all belong to Minecraft.Windows.exe.
 		if (gameModePlayer != localPlayer || !gameModeVtableInMinecraft || !buildBlockInMinecraft || !attackInMinecraft) {
 			logF("[compat] Live LocalPlayer/GameMode validation FAILED");
 			return false;
@@ -318,8 +295,6 @@ public:
 		logF("[compat] Minecraft module base: %llX", module->ptrBase);
 		logMinecraftBinaryInfo();
 
-		// First determine whether the archived Horion 1.18-era memory model still
-		// resembles the running build. Never dereference these results here.
 		const SignatureCheck archivedChecks[] = {
 			{"ClientInstance (archived)", "48 8B 15 ? ? ? ? 4C 8B 02 4C 89 06 40 84 FF 74 ? 48 8B CD E8 ? ? ? ? 48 8B C6 48 8B 4C 24 ? 48 33 CC E8 ? ? ? ? 48 8B 5C 24 ? 48 8B 6C 24 ? 48 8B 74 24 ? 48 83 C4 ? 5F C3 B9 ? ? ? ? E8 ? ? ? ? CC E8 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 ? 48 89 6C 24 ? 56"},
 			{"KeyMap (archived)", "48 8D 0D ?? ?? ?? ?? 89 1C B9"},
@@ -348,10 +323,7 @@ public:
 				{"HID key/mouse candidate", "48 89 5C ? ? 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 81 EC ? ? ? ? ? ? 74 24 ? ? ? 7C 24 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 ? 49 8B F8"}
 			};
 
-			scanSignatures(
-				"1.21.130 bridge candidates",
-				bridgeCandidates,
-				sizeof(bridgeCandidates) / sizeof(bridgeCandidates[0]));
+			scanSignatures("1.21.130 bridge candidates", bridgeCandidates, sizeof(bridgeCandidates) / sizeof(bridgeCandidates[0]));
 
 			const SignatureCheck modern1264xCandidates[] = {
 				{"Platform_GameCore global", "4C 89 3D ? ? ? ? 4D 85 FF"},
@@ -365,10 +337,7 @@ public:
 				{"MouseDevice::feed", "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 44 89 CF 44 89 C3 89 D5 48 89 CE 44 0F B7 A4 24 C0 00 00 00 44 0F B7 AC 24 B8 00 00 00 44 0F B7 BC 24 B0 00 00 00 0F B6 84 24 C8 00 00 00"}
 			};
 
-			const int modernFound = scanSignatures(
-				"Bedrock 1.26.4x modern candidates",
-				modern1264xCandidates,
-				sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]));
+			const int modernFound = scanSignatures("Bedrock 1.26.4x modern candidates", modern1264xCandidates, sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]));
 
 			if (modernFound == static_cast<int>(sizeof(modern1264xCandidates) / sizeof(modern1264xCandidates[0]))) {
 				const bool runtimeOk = probeModernRuntime();
@@ -378,10 +347,7 @@ public:
 					{"ScreenView::setupAndRender", "E8 ? ? ? ? 48 8B 4B ? 48 85 C9 74 ? 48 8B 01 48 8B 40 ? 48 89 FA FF 15 ? ? ? ? 48 8D 4D"},
 					{"MinecraftGame::_update", "E8 ? ? ? ? 48 8B 8F ? ? ? ? BA ? ? ? ? E8 ? ? ? ? 48 8B 9F"}
 				};
-				scanSignatures(
-					"Bedrock 1.26 UI/input hook candidates",
-					modernHookCandidates,
-					sizeof(modernHookCandidates) / sizeof(modernHookCandidates[0]));
+				scanSignatures("Bedrock 1.26 UI/input hook candidates", modernHookCandidates, sizeof(modernHookCandidates) / sizeof(modernHookCandidates[0]));
 
 				abortStartup(runtimeOk
 					? "modern 1.26 runtime objects validated; UI/input hook candidates were logged"
@@ -400,7 +366,6 @@ public:
 		logF("[compat] GameData initialization returned with ClientInstance=%llX", g_Data.getClientInstance());
 	}
 
-	// Forward the remaining static helpers used by Loader.cpp.
 	static bool canUseMoveKeys() { return ::GameData::canUseMoveKeys(); }
 	static bool isKeyDown(int key) { return ::GameData::isKeyDown(key); }
 	static bool isKeyPressed(int key) { return ::GameData::isKeyPressed(key); }
@@ -409,6 +374,4 @@ public:
 	static bool shouldHide() { return ::GameData::shouldHide(); }
 };
 
-// Only translation units that include Loader.h use the compatibility wrapper;
-// the underlying GameData implementation remains unchanged.
 #define GameData HorionCompatGameData
