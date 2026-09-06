@@ -16,6 +16,7 @@ namespace Modern126Overlay {
 	inline bool loggedGuiScale = false;
 	inline bool loggedFontInfo = false;
 	inline bool loggedTextAlpha = false;
+	inline bool loggedClipReset = false;
 
 	struct RectangleArea {
 		float left;
@@ -263,6 +264,41 @@ namespace Modern126Overlay {
 		}
 	}
 
+	// ScreenView may leave the UI render context with a control-specific clipping
+	// rectangle after the layer render returns. Text respects that state more
+	// strictly than the simple rectangle canary. Save the current clip, switch to
+	// the full UI clip for our text pass, then restore Minecraft's state.
+	inline bool beginFullClipGuarded(void* renderContext) {
+		if (renderContext == nullptr)
+			return false;
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			if (vtable == nullptr || !addressInMinecraft(vtable[0x18]) || !addressInMinecraft(vtable[0x17]))
+				return false;
+			using Fn = void(__fastcall*)(void*);
+			reinterpret_cast<Fn>(vtable[0x18])(renderContext);
+			reinterpret_cast<Fn>(vtable[0x17])(renderContext);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	inline void endFullClipGuarded(void* renderContext, bool savedClip) {
+		if (!savedClip || renderContext == nullptr)
+			return;
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			if (vtable == nullptr || !addressInMinecraft(vtable[0x19]))
+				return;
+			using Fn = void(__fastcall*)(void*);
+			reinterpret_cast<Fn>(vtable[0x19])(renderContext);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+	}
+
 	inline void toggle() {
 		visible = !visible;
 		logF("[modern] INSERT toggled test menu %s", visible ? "ON" : "OFF");
@@ -282,8 +318,8 @@ namespace Modern126Overlay {
 			return RectangleArea { left * scale, right * scale, top * scale, bottom * scale };
 		};
 
-		// Diagnostic pass: intentionally draw no rectangles. If text now remains
-		// visible, the rectangle batch/flush path was covering the text afterward.
+		// Diagnostic pass: intentionally draw no rectangles. If text remains visible
+		// with the full clip forced, the post-layer clipping state was hiding it.
 		const Color text { 0.95f, 0.97f, 1.00f, 1.00f };
 		const Color muted { 0.70f, 0.76f, 0.84f, 1.00f };
 
@@ -327,9 +363,15 @@ namespace Modern126Overlay {
 				previousTextAlpha);
 		}
 
-		static const std::string title = "HORION TEXT-ONLY TEST";
+		const bool clipSaved = beginFullClipGuarded(renderContext);
+		if (!loggedClipReset) {
+			loggedClipReset = true;
+			logF("[modern] Full clipping rectangle text diagnostic=%s", clipSaved ? "ACTIVE" : "UNAVAILABLE");
+		}
+
+		static const std::string title = "HORION FULL-CLIP TEXT TEST";
 		static const std::string line1 = "Modern runtime bridge";
-		static const std::string line2 = "No rectangle draw calls";
+		static const std::string line2 = "Full clipping rectangle forced";
 		static const std::string line3 = "INSERT closes this test";
 
 		const bool textCallsOk =
@@ -339,19 +381,20 @@ namespace Modern126Overlay {
 			drawTextGuarded(renderContext, font, scaledRect(44.f, 304.f, 166.f, 200.f), line3, muted, 30.f, scale, lineHeight);
 		const bool textOk = textCallsOk && flushTextGuarded(renderContext);
 
+		endFullClipGuarded(renderContext, clipSaved);
 		if (textAlphaOk)
 			setTextAlphaGuarded(renderContext, previousTextAlpha);
 
 		if (textOk) {
 			if (!loggedText) {
 				loggedText = true;
-				logF("[modern] Text-only drawText + flushText completed; no rectangles were submitted");
+				logF("[modern] Full-clip text-only drawText + flushText completed");
 			}
 		} else {
 			textEnabled = false;
 			if (!loggedTextFailure) {
 				loggedTextFailure = true;
-				logF("[modern] Text-only drawText path failed and was disabled");
+				logF("[modern] Full-clip text-only drawText path failed and was disabled");
 			}
 		}
 	}
