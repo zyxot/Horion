@@ -195,23 +195,25 @@ namespace Modern126Runtime {
 		original(renderContext, lastFlush, optionalFlush);
 	}
 
+	// Keep SEH isolated in a trivial helper. MSVC does not allow __try in a
+	// function that also needs C++ object unwinding (such as make_unique below).
+	inline uintptr_t getTextFlushTargetGuarded(void* renderContext) {
+		if (renderContext == nullptr)
+			return 0;
+		__try {
+			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
+			return vtable != nullptr ? vtable[0x6] : 0;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
+		}
+	}
+
 	inline bool ensureTextFlushHook(void* renderContext) {
 		if (textFlushHook)
 			return true;
-		if (renderContext == nullptr)
-			return false;
 
-		uintptr_t target = 0;
-		__try {
-			auto* vtable = *reinterpret_cast<uintptr_t**>(renderContext);
-			if (vtable == nullptr)
-				return false;
-			target = vtable[0x6];
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			return false;
-		}
-
+		const uintptr_t target = getTextFlushTargetGuarded(renderContext);
 		if (!addressInMinecraft(target))
 			return false;
 
