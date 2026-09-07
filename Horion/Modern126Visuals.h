@@ -13,48 +13,14 @@
 // sampled through the maintained 1.26 layouts, then drawn by the already-stable
 // Direct2D Present renderer. No packet or anti-cheat behavior lives here.
 namespace Modern126Visuals {
-	struct Vec2Lite {
-		float x;
-		float y;
-	};
-
-	struct Vec3Lite {
-		float x;
-		float y;
-		float z;
-	};
-
-	struct AabbLite {
-		Vec3Lite lower;
-		Vec3Lite higher;
-	};
-
-	struct AabbShapeLite {
-		AabbLite boundingBox;
-		Vec2Lite size;
-	};
-
-	struct StateVectorLite {
-		Vec3Lite pos;
-		Vec3Lite posOld;
-		Vec3Lite velocity;
-	};
-
-	struct BlockPosLite {
-		int x;
-		int y;
-		int z;
-	};
-
-	struct BlockHit {
-		BlockPosLite pos;
-		uint64_t hash;
-	};
-
-	struct Mat4Lite {
-		float m[16];
-	};
-
+	struct Vec2Lite { float x; float y; };
+	struct Vec3Lite { float x; float y; float z; };
+	struct AabbLite { Vec3Lite lower; Vec3Lite higher; };
+	struct AabbShapeLite { AabbLite boundingBox; Vec2Lite size; };
+	struct StateVectorLite { Vec3Lite pos; Vec3Lite posOld; Vec3Lite velocity; };
+	struct BlockPosLite { int x; int y; int z; };
+	struct BlockHit { BlockPosLite pos; uint64_t hash; };
+	struct Mat4Lite { float m[16]; };
 	struct ProjectionContext {
 		Vec3Lite origin;
 		Mat4Lite view;
@@ -63,12 +29,22 @@ namespace Modern126Visuals {
 	};
 
 	inline std::vector<AabbLite> entityBoxes;
+	inline std::vector<AabbLite> entityScratch;
+	inline std::vector<void*> actorScratch;
 	inline std::vector<BlockHit> blockBoxes;
 	inline std::vector<BlockHit> blockScanWorking;
+
 	inline ULONGLONG lastEntityRefresh = 0;
+	inline ULONGLONG lastBlockScanComplete = 0;
 	inline bool blockScanCenterValid = false;
 	inline BlockPosLite blockScanCenter = {};
 	inline size_t blockScanCursor = 0;
+
+	inline ProjectionContext cachedProjection = {};
+	inline ID2D1Bitmap1* cachedProjectionTarget = nullptr;
+	inline ULONGLONG lastProjectionRefresh = 0;
+	inline bool cachedProjectionValid = false;
+
 	inline bool loggedEntityReady = false;
 	inline bool loggedEntityFailure = false;
 	inline bool loggedProjectionReady = false;
@@ -140,22 +116,18 @@ namespace Modern126Visuals {
 		void* minecraft = nullptr;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(ci) + 0x1A8), &minecraft) || minecraft == nullptr)
 			return nullptr;
-
 		void* session = nullptr;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(minecraft) + 0xC0), &session) || session == nullptr)
 			return nullptr;
-
 		uint8_t sessionReady = 0;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(session) + 0x28), &sessionReady) || sessionReady != 1)
 			return nullptr;
-
 		uint8_t* controlBlock = nullptr;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(session) + 0x30), &controlBlock) || controlBlock == nullptr)
 			return nullptr;
 		uint8_t controlReady = 0;
 		if (!safeRead(controlBlock, &controlReady) || controlReady != 1)
 			return nullptr;
-
 		void* level = nullptr;
 		return safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(session) + 0x40), &level) ? level : nullptr;
 	}
@@ -216,27 +188,26 @@ namespace Modern126Visuals {
 		AabbShapeLite copy = {};
 		if (!safeRead(shape, &copy) || !finiteVec3(copy.boundingBox.lower) || !finiteVec3(copy.boundingBox.higher))
 			return false;
-
 		const float width = copy.boundingBox.higher.x - copy.boundingBox.lower.x;
 		const float height = copy.boundingBox.higher.y - copy.boundingBox.lower.y;
 		const float depth = copy.boundingBox.higher.z - copy.boundingBox.lower.z;
 		if (width <= 0.01f || height <= 0.01f || depth <= 0.01f || width > 20.0f || height > 20.0f || depth > 20.0f)
 			return false;
-
 		*out = copy.boundingBox;
 		return true;
 	}
 
 	inline bool refreshEntityBoxes() {
 		const ULONGLONG now = GetTickCount64();
-		if (now - lastEntityRefresh < 100)
+		// 175 ms is visually smooth for boxes/tracers but substantially lowers guarded
+		// actor/component reads compared with the previous 100 ms refresh cadence.
+		if (now - lastEntityRefresh < 175)
 			return true;
 		lastEntityRefresh = now;
 
 		void* level = resolveLevel();
 		if (level == nullptr)
 			return false;
-
 		uintptr_t* vtable = nullptr;
 		if (!safeRead(level, &vtable) || vtable == nullptr)
 			return false;
@@ -244,8 +215,10 @@ namespace Modern126Visuals {
 		if (!safeRead(vtable + 0x145, &listTarget) || !addressInMinecraft(listTarget))
 			return false;
 
-		std::vector<void*> actors;
-		if (!callGetRuntimeActorList(level, listTarget, actors)) {
+		actorScratch.clear();
+		if (actorScratch.capacity() < 256)
+			actorScratch.reserve(256);
+		if (!callGetRuntimeActorList(level, listTarget, actorScratch)) {
 			if (!loggedEntityFailure) {
 				loggedEntityFailure = true;
 				logF("[modern] ESP actor snapshot call failed; visual boxes skipped");
@@ -257,9 +230,10 @@ namespace Modern126Visuals {
 		Vec3Lite localPos = {};
 		const bool haveLocalPos = resolveActorPosition(localPlayer, &localPos);
 
-		std::vector<AabbLite> next;
-		next.reserve(std::min<size_t>(actors.size(), 256));
-		for (void* actor : actors) {
+		entityScratch.clear();
+		if (entityScratch.capacity() < 256)
+			entityScratch.reserve(256);
+		for (void* actor : actorScratch) {
 			if (actor == nullptr || actor == localPlayer)
 				continue;
 			AabbLite box = {};
@@ -277,15 +251,15 @@ namespace Modern126Visuals {
 				if ((dx * dx + dy * dy + dz * dz) > (128.0f * 128.0f))
 					continue;
 			}
-			next.push_back(box);
-			if (next.size() >= 512)
+			entityScratch.push_back(box);
+			if (entityScratch.size() >= 512)
 				break;
 		}
-		entityBoxes.swap(next);
+		entityBoxes.swap(entityScratch);
 		loggedEntityFailure = false;
 		if (!loggedEntityReady) {
 			loggedEntityReady = true;
-			logF("[modern] ESP actor snapshot bridge READY actors=%zu slot=0x145", entityBoxes.size());
+			logF("[modern] ESP actor snapshot bridge READY actors=%zu slot=0x145 refresh=175ms", entityBoxes.size());
 		}
 		return true;
 	}
@@ -351,6 +325,8 @@ namespace Modern126Visuals {
 		blockScanCenterValid = true;
 		blockScanCursor = 0;
 		blockScanWorking.clear();
+		if (blockScanWorking.capacity() < 128)
+			blockScanWorking.reserve(128);
 	}
 
 	inline bool refreshBlockBoxes() {
@@ -364,10 +340,26 @@ namespace Modern126Visuals {
 			static_cast<int>(std::floor(localPos.y)),
 			static_cast<int>(std::floor(localPos.z))
 		};
-		if (!blockScanCenterValid ||
+
+		constexpr int radius = 12;
+		constexpr int side = radius * 2 + 1;
+		constexpr size_t total = static_cast<size_t>(side) * side * side;
+		constexpr size_t blocksPerFrame = 32;
+		constexpr ULONGLONG rescanCooldownMs = 2000;
+		const ULONGLONG now = GetTickCount64();
+
+		const bool moved = blockScanCenterValid && (
 			std::abs(currentCenter.x - blockScanCenter.x) > 4 ||
 			std::abs(currentCenter.y - blockScanCenter.y) > 4 ||
-			std::abs(currentCenter.z - blockScanCenter.z) > 4) {
+			std::abs(currentCenter.z - blockScanCenter.z) > 4);
+
+		if (!blockScanCenterValid || moved) {
+			beginBlockScan(currentCenter);
+		} else if (blockScanCursor >= total) {
+			// Keep rendering the last completed result set instead of immediately
+			// starting another 15,625-block scan. Movement still forces a fresh scan.
+			if (now - lastBlockScanComplete < rescanCooldownMs)
+				return true;
 			beginBlockScan(currentCenter);
 		}
 
@@ -386,11 +378,6 @@ namespace Modern126Visuals {
 			return false;
 		}
 
-		constexpr int radius = 12;
-		constexpr int side = radius * 2 + 1;
-		constexpr size_t total = static_cast<size_t>(side) * side * side;
-		constexpr size_t blocksPerFrame = 128;
-
 		for (size_t work = 0; work < blocksPerFrame && blockScanCursor < total; ++work, ++blockScanCursor) {
 			const size_t index = blockScanCursor;
 			const int dx = static_cast<int>(index % side) - radius;
@@ -408,13 +395,13 @@ namespace Modern126Visuals {
 
 		if (blockScanCursor >= total) {
 			blockBoxes = blockScanWorking;
+			lastBlockScanComplete = now;
 			if (!loggedBlockReady) {
 				loggedBlockReady = true;
-				logF("[modern] BlockESP scanner READY radius=%d valuableBlocks=%zu preset=diamond/emerald/gold/ancient_debris",
-					radius, blockBoxes.size());
+				logF("[modern] BlockESP scanner READY radius=%d valuableBlocks=%zu budget=%zu/frame cooldown=%llums",
+					radius, blockBoxes.size(), blocksPerFrame, static_cast<unsigned long long>(rescanCooldownMs));
 			}
 			loggedBlockFailure = false;
-			beginBlockScan(currentCenter);
 		}
 		return true;
 	}
@@ -422,11 +409,16 @@ namespace Modern126Visuals {
 	inline bool createProjectionContext(ID2D1Bitmap1* target, ProjectionContext* out) {
 		if (target == nullptr || out == nullptr)
 			return false;
+		const ULONGLONG now = GetTickCount64();
+		if (cachedProjectionValid && cachedProjectionTarget == target && now - lastProjectionRefresh <= 2) {
+			*out = cachedProjection;
+			return true;
+		}
+
 		void* ci = Modern126Gameplay::clientInstance;
 		void* minecraftGame = resolveMinecraftGame();
 		if (ci == nullptr || minecraftGame == nullptr)
 			return false;
-
 		void* levelRenderer = nullptr;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(ci) + 0x1B8), &levelRenderer) || levelRenderer == nullptr)
 			return false;
@@ -437,7 +429,6 @@ namespace Modern126Visuals {
 		ProjectionContext next = {};
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(levelRendererPlayer) + 0x660), &next.origin) || !finiteVec3(next.origin))
 			return false;
-
 		void* gameRenderer = nullptr;
 		if (!safeRead(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(minecraftGame) + 0x1318), &gameRenderer) || gameRenderer == nullptr)
 			return false;
@@ -449,10 +440,15 @@ namespace Modern126Visuals {
 		next.screen = target->GetSize();
 		if (next.screen.width < 32.0f || next.screen.height < 32.0f)
 			return false;
+		cachedProjection = next;
+		cachedProjectionTarget = target;
+		lastProjectionRefresh = now;
+		cachedProjectionValid = true;
 		*out = next;
+
 		if (!loggedProjectionReady) {
 			loggedProjectionReady = true;
-			logF("[modern] ESP projection bridge READY renderer=%llX origin=(%.1f, %.1f, %.1f)",
+			logF("[modern] ESP projection bridge READY renderer=%llX origin=(%.1f, %.1f, %.1f) cache=ON",
 				reinterpret_cast<uintptr_t>(gameRenderer), next.origin.x, next.origin.y, next.origin.z);
 		}
 		loggedProjectionFailure = false;
@@ -513,6 +509,17 @@ namespace Modern126Visuals {
 		return true;
 	}
 
+	inline void drawWireBox(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush,
+		const std::array<D2D1_POINT_2F, 8>& points, float thickness) {
+		static constexpr int edges[12][2] = {
+			{ 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 },
+			{ 4, 5 }, { 5, 6 }, { 6, 7 }, { 7, 4 },
+			{ 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }
+		};
+		for (const auto& edge : edges)
+			context->DrawLine(points[edge[0]], points[edge[1]], brush, thickness);
+	}
+
 	inline void drawEntityEsp(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, const ProjectionContext& projection) {
 		if (context == nullptr || brush == nullptr)
 			return;
@@ -536,17 +543,6 @@ namespace Modern126Visuals {
 				continue;
 			context->DrawRectangle(D2D1::RectF(minX, minY, maxX, maxY), brush, 2.0f);
 		}
-	}
-
-	inline void drawWireBox(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush,
-		const std::array<D2D1_POINT_2F, 8>& points, float thickness) {
-		static constexpr int edges[12][2] = {
-			{ 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 },
-			{ 4, 5 }, { 5, 6 }, { 6, 7 }, { 7, 4 },
-			{ 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }
-		};
-		for (const auto& edge : edges)
-			context->DrawLine(points[edge[0]], points[edge[1]], brush, thickness);
 	}
 
 	inline void drawBlockEsp(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, const ProjectionContext& projection) {
@@ -579,7 +575,6 @@ namespace Modern126Visuals {
 			}
 			return;
 		}
-
 		if (espEnabled)
 			drawEntityEsp(context, espBrush, projection);
 		if (blockEspEnabled)
@@ -588,10 +583,16 @@ namespace Modern126Visuals {
 
 	inline void shutdown() {
 		entityBoxes.clear();
+		entityScratch.clear();
+		actorScratch.clear();
 		blockBoxes.clear();
 		blockScanWorking.clear();
 		blockScanCenterValid = false;
 		blockScanCursor = 0;
 		lastEntityRefresh = 0;
+		lastBlockScanComplete = 0;
+		cachedProjectionValid = false;
+		cachedProjectionTarget = nullptr;
+		lastProjectionRefresh = 0;
 	}
 }
