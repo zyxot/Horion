@@ -11,13 +11,19 @@
 // These reuse the stable entity projection and LocalPlayer component paths.
 namespace Modern126Extras {
 	inline bool tracersEnabled = false;
+	inline bool threeDBoxesEnabled = false;
+	inline bool fovCircleEnabled = false;
 	inline bool coordinatesEnabled = false;
 	inline bool speedEnabled = false;
 	inline bool directionEnabled = false;
+	inline bool entityCountEnabled = false;
+
 	inline bool menuLeftWasDown = false;
 	inline uint64_t toggleCount = 0;
 	inline bool loggedTracersReady = false;
+	inline bool loggedThreeDReady = false;
 	inline bool loggedTelemetryReady = false;
+	inline bool loggedEntityCountReady = false;
 
 	struct Telemetry {
 		Modern126Gameplay::Vec3Lite pos;
@@ -25,8 +31,13 @@ namespace Modern126Extras {
 		float yaw;
 	};
 
+	inline Telemetry cachedTelemetry = {};
+	inline ULONGLONG lastTelemetryRefresh = 0;
+	inline bool cachedTelemetryValid = false;
+
 	inline bool anyEnabled() {
-		return tracersEnabled || coordinatesEnabled || speedEnabled || directionEnabled;
+		return tracersEnabled || threeDBoxesEnabled || fovCircleEnabled || coordinatesEnabled ||
+			speedEnabled || directionEnabled || entityCountEnabled;
 	}
 
 	inline void logToggle(const char* name, bool enabled) {
@@ -43,10 +54,15 @@ namespace Modern126Extras {
 	inline bool readTelemetry(Telemetry* out) {
 		if (out == nullptr)
 			return false;
+		const ULONGLONG now = GetTickCount64();
+		if (cachedTelemetryValid && now - lastTelemetryRefresh < 50) {
+			*out = cachedTelemetry;
+			return true;
+		}
+
 		void* localPlayer = Modern126Gameplay::refreshLocalPlayer();
 		if (localPlayer == nullptr)
 			return false;
-
 		Modern126Gameplay::StateVectorLite* state = nullptr;
 		Modern126Gameplay::ActorRotationLite* rotation = nullptr;
 		if (!Modern126Gameplay::resolveFlyComponents(localPlayer, &state, &rotation) || state == nullptr || rotation == nullptr)
@@ -61,15 +77,20 @@ namespace Modern126Extras {
 				!std::isfinite(next.velocity.x) || !std::isfinite(next.velocity.y) || !std::isfinite(next.velocity.z) ||
 				!std::isfinite(next.yaw))
 				return false;
+
+			cachedTelemetry = next;
+			lastTelemetryRefresh = now;
+			cachedTelemetryValid = true;
 			*out = next;
 			if (!loggedTelemetryReady) {
 				loggedTelemetryReady = true;
-				logF("[modern] HUD telemetry bridge READY StateVector=%llX Rotation=%llX",
+				logF("[modern] HUD telemetry bridge READY StateVector=%llX Rotation=%llX cache=50ms",
 					reinterpret_cast<uintptr_t>(state), reinterpret_cast<uintptr_t>(rotation));
 			}
 			return true;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
+			cachedTelemetryValid = false;
 			return false;
 		}
 	}
@@ -86,14 +107,17 @@ namespace Modern126Extras {
 		return names[sector];
 	}
 
+	inline bool getProjection(ID2D1Bitmap1* target, Modern126Visuals::ProjectionContext* projection) {
+		return target != nullptr && projection != nullptr &&
+			Modern126Visuals::createProjectionContext(target, projection);
+	}
+
 	inline void drawTracers(ID2D1DeviceContext* context, ID2D1Bitmap1* target, ID2D1SolidColorBrush* brush) {
 		if (!tracersEnabled || context == nullptr || target == nullptr || brush == nullptr)
 			return;
 
 		Modern126Visuals::ProjectionContext projection = {};
-		if (!Modern126Visuals::createProjectionContext(target, &projection))
-			return;
-		if (!Modern126Visuals::refreshEntityBoxes())
+		if (!getProjection(target, &projection) || !Modern126Visuals::refreshEntityBoxes())
 			return;
 
 		const D2D1_POINT_2F start = D2D1::Point2F(projection.screen.width * 0.5f, projection.screen.height - 2.0f);
@@ -109,30 +133,71 @@ namespace Modern126Extras {
 			if (end.x < -projection.screen.width || end.x > projection.screen.width * 2.0f ||
 				end.y < -projection.screen.height || end.y > projection.screen.height * 2.0f)
 				continue;
-			context->DrawLine(start, end, brush, 1.4f);
+			context->DrawLine(start, end, brush, 1.25f);
 		}
 
 		if (!loggedTracersReady) {
 			loggedTracersReady = true;
-			logF("[modern] Visuals/Tracers projection READY entities=%zu", Modern126Visuals::entityBoxes.size());
+			logF("[modern] Visuals/Tracers projection READY entities=%zu sharedCache=ON", Modern126Visuals::entityBoxes.size());
 		}
 	}
 
-	inline void drawTelemetryHud(ID2D1DeviceContext* context, ID2D1Bitmap1* target,
+	inline void drawThreeDBoxes(ID2D1DeviceContext* context, ID2D1Bitmap1* target, ID2D1SolidColorBrush* brush) {
+		if (!threeDBoxesEnabled || context == nullptr || target == nullptr || brush == nullptr)
+			return;
+
+		Modern126Visuals::ProjectionContext projection = {};
+		if (!getProjection(target, &projection) || !Modern126Visuals::refreshEntityBoxes())
+			return;
+
+		for (const auto& box : Modern126Visuals::entityBoxes) {
+			std::array<D2D1_POINT_2F, 8> points = {};
+			if (!Modern126Visuals::projectBox(box, projection, &points))
+				continue;
+			Modern126Visuals::drawWireBox(context, brush, points, 1.25f);
+		}
+
+		if (!loggedThreeDReady) {
+			loggedThreeDReady = true;
+			logF("[modern] Visuals/3DBoxes READY entities=%zu", Modern126Visuals::entityBoxes.size());
+		}
+	}
+
+	inline void drawFovCircle(ID2D1DeviceContext* context, ID2D1Bitmap1* target, ID2D1SolidColorBrush* brush) {
+		if (!fovCircleEnabled || context == nullptr || target == nullptr || brush == nullptr)
+			return;
+		const D2D1_SIZE_F size = target->GetSize();
+		const float radius = std::max(70.0f, std::min(size.width, size.height) * 0.16f);
+		const D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(size.width * 0.5f, size.height * 0.5f), radius, radius);
+		context->DrawEllipse(circle, brush, 1.35f);
+	}
+
+	inline void drawHud(ID2D1DeviceContext* context, ID2D1Bitmap1* target,
 		IDWriteTextFormat* textFormat, ID2D1SolidColorBrush* panelBrush, ID2D1SolidColorBrush* textBrush) {
-		if ((!coordinatesEnabled && !speedEnabled && !directionEnabled) || context == nullptr || target == nullptr ||
-			textFormat == nullptr || panelBrush == nullptr || textBrush == nullptr)
+		if ((!coordinatesEnabled && !speedEnabled && !directionEnabled && !entityCountEnabled) ||
+			context == nullptr || target == nullptr || textFormat == nullptr || panelBrush == nullptr || textBrush == nullptr)
 			return;
 
 		Telemetry telemetry = {};
-		if (!readTelemetry(&telemetry))
+		const bool needTelemetry = coordinatesEnabled || speedEnabled || directionEnabled;
+		const bool haveTelemetry = !needTelemetry || readTelemetry(&telemetry);
+		if (needTelemetry && !haveTelemetry)
 			return;
+
+		if (entityCountEnabled) {
+			Modern126Visuals::refreshEntityBoxes();
+			if (!loggedEntityCountReady) {
+				loggedEntityCountReady = true;
+				logF("[modern] HUD/EntityCount READY sharedEntitySnapshot=ON");
+			}
+		}
 
 		const D2D1_SIZE_F size = target->GetSize();
 		int rows = 0;
 		if (coordinatesEnabled) ++rows;
 		if (speedEnabled) ++rows;
 		if (directionEnabled) ++rows;
+		if (entityCountEnabled) ++rows;
 		float top = size.height - 14.0f - static_cast<float>(rows) * 32.0f;
 		if (top < 12.0f)
 			top = 12.0f;
@@ -157,46 +222,66 @@ namespace Modern126Extras {
 		}
 		if (directionEnabled) {
 			float normalized = std::fmod(telemetry.yaw, 360.0f);
-			if (normalized < 0.0f) normalized += 360.0f;
+			if (normalized < 0.0f)
+				normalized += 360.0f;
 			swprintf_s(text, _countof(text), L"Facing: %ls  %.0f deg", directionName(telemetry.yaw), normalized);
 			drawRow(text, 245.0f);
+		}
+		if (entityCountEnabled) {
+			swprintf_s(text, _countof(text), L"Entities: %zu", Modern126Visuals::entityBoxes.size());
+			drawRow(text, 175.0f);
 		}
 	}
 
 	inline void render(ID2D1DeviceContext* context, ID2D1Bitmap1* target,
 		IDWriteTextFormat* textFormat, ID2D1SolidColorBrush* panelBrush,
 		ID2D1SolidColorBrush* tracerBrush, ID2D1SolidColorBrush* textBrush) {
+		drawThreeDBoxes(context, target, tracerBrush);
 		drawTracers(context, target, tracerBrush);
-		drawTelemetryHud(context, target, textFormat, panelBrush, textBrush);
+		drawFovCircle(context, target, tracerBrush);
+		drawHud(context, target, textFormat, panelBrush, textBrush);
 	}
 
 	inline void drawMenu(ID2D1DeviceContext* context, IDWriteTextFormat* titleFormat, IDWriteTextFormat* bodyFormat,
 		ID2D1SolidColorBrush* panelBrush, ID2D1SolidColorBrush* headerBrush,
 		ID2D1SolidColorBrush* hoverBrush, ID2D1SolidColorBrush* activeBrush, ID2D1SolidColorBrush* textBrush,
 		const POINT& mouse, bool mouseValid, bool menuVisible) {
-		if (!menuVisible || context == nullptr || titleFormat == nullptr || bodyFormat == nullptr)
-		{
+		if (!menuVisible || context == nullptr || titleFormat == nullptr || bodyFormat == nullptr) {
 			menuLeftWasDown = false;
 			return;
 		}
 
-		const D2D1_RECT_F panel = { 24.0f, 328.0f, 580.0f, 486.0f };
-		const D2D1_RECT_F header = { 24.0f, 328.0f, 580.0f, 362.0f };
-		const D2D1_RECT_F tracerButton = { 38.0f, 400.0f, 286.0f, 441.0f };
-		const D2D1_RECT_F coordsButton = { 318.0f, 400.0f, 566.0f, 441.0f };
-		const D2D1_RECT_F speedButton = { 318.0f, 448.0f, 438.0f, 481.0f };
-		const D2D1_RECT_F directionButton = { 446.0f, 448.0f, 566.0f, 481.0f };
+		const D2D1_RECT_F panel = { 24.0f, 328.0f, 860.0f, 544.0f };
+		const D2D1_RECT_F header = { 24.0f, 328.0f, 860.0f, 362.0f };
+
+		const D2D1_RECT_F tracerButton = { 38.0f, 400.0f, 286.0f, 437.0f };
+		const D2D1_RECT_F boxesButton = { 38.0f, 444.0f, 286.0f, 481.0f };
+		const D2D1_RECT_F fovButton = { 38.0f, 488.0f, 286.0f, 525.0f };
+
+		const D2D1_RECT_F coordsButton = { 318.0f, 400.0f, 566.0f, 437.0f };
+		const D2D1_RECT_F speedButton = { 318.0f, 444.0f, 438.0f, 481.0f };
+		const D2D1_RECT_F directionButton = { 446.0f, 444.0f, 566.0f, 481.0f };
+		const D2D1_RECT_F entityButton = { 318.0f, 488.0f, 566.0f, 525.0f };
 
 		const bool hoverTracer = mouseValid && pointInside(mouse, tracerButton);
+		const bool hoverBoxes = mouseValid && pointInside(mouse, boxesButton);
+		const bool hoverFov = mouseValid && pointInside(mouse, fovButton);
 		const bool hoverCoords = mouseValid && pointInside(mouse, coordsButton);
 		const bool hoverSpeed = mouseValid && pointInside(mouse, speedButton);
 		const bool hoverDirection = mouseValid && pointInside(mouse, directionButton);
+		const bool hoverEntity = mouseValid && pointInside(mouse, entityButton);
 
 		const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 		if (leftDown && !menuLeftWasDown) {
 			if (hoverTracer) {
 				tracersEnabled = !tracersEnabled;
 				logToggle("Visuals/Tracers", tracersEnabled);
+			} else if (hoverBoxes) {
+				threeDBoxesEnabled = !threeDBoxesEnabled;
+				logToggle("Visuals/3DBoxes", threeDBoxesEnabled);
+			} else if (hoverFov) {
+				fovCircleEnabled = !fovCircleEnabled;
+				logToggle("Visuals/FOVCircle", fovCircleEnabled);
 			} else if (hoverCoords) {
 				coordinatesEnabled = !coordinatesEnabled;
 				logToggle("HUD/Coordinates", coordinatesEnabled);
@@ -206,6 +291,9 @@ namespace Modern126Extras {
 			} else if (hoverDirection) {
 				directionEnabled = !directionEnabled;
 				logToggle("HUD/Direction", directionEnabled);
+			} else if (hoverEntity) {
+				entityCountEnabled = !entityCountEnabled;
+				logToggle("HUD/EntityCount", entityCountEnabled);
 			}
 		}
 		menuLeftWasDown = leftDown;
@@ -215,7 +303,7 @@ namespace Modern126Extras {
 		static const wchar_t title[] = L"MORE VISUALS + HUD";
 		static const wchar_t visuals[] = L"VISUALS";
 		static const wchar_t hud[] = L"HUD";
-		context->DrawText(title, _countof(title) - 1, titleFormat, D2D1::RectF(36.0f, 333.0f, 570.0f, 360.0f), textBrush);
+		context->DrawText(title, _countof(title) - 1, titleFormat, D2D1::RectF(36.0f, 333.0f, 850.0f, 360.0f), textBrush);
 		context->DrawText(visuals, _countof(visuals) - 1, bodyFormat, D2D1::RectF(38.0f, 370.0f, 286.0f, 396.0f), textBrush);
 		context->DrawText(hud, _countof(hud) - 1, bodyFormat, D2D1::RectF(318.0f, 370.0f, 566.0f, 396.0f), textBrush);
 
@@ -224,21 +312,29 @@ namespace Modern126Extras {
 			ID2D1SolidColorBrush* brush = enabled ? activeBrush : (hovered ? hoverBrush : headerBrush);
 			context->FillRectangle(rect, brush);
 			const wchar_t* text = enabled ? onText : offText;
-			const D2D1_RECT_F textRect = { rect.left + 10.0f, rect.top + 6.0f, rect.right - 5.0f, rect.bottom - 3.0f };
+			const D2D1_RECT_F textRect = { rect.left + 10.0f, rect.top + 5.0f, rect.right - 5.0f, rect.bottom - 3.0f };
 			context->DrawText(text, static_cast<UINT32>(wcslen(text)), bodyFormat, textRect, textBrush);
 		};
 
 		drawToggle(tracerButton, tracersEnabled, hoverTracer, L"TRACERS: ON", L"TRACERS: OFF");
+		drawToggle(boxesButton, threeDBoxesEnabled, hoverBoxes, L"3D BOXES: ON", L"3D BOXES: OFF");
+		drawToggle(fovButton, fovCircleEnabled, hoverFov, L"FOV CIRCLE: ON", L"FOV CIRCLE: OFF");
 		drawToggle(coordsButton, coordinatesEnabled, hoverCoords, L"COORDINATES: ON", L"COORDINATES: OFF");
 		drawToggle(speedButton, speedEnabled, hoverSpeed, L"SPEED: ON", L"SPEED: OFF");
 		drawToggle(directionButton, directionEnabled, hoverDirection, L"DIR: ON", L"DIR: OFF");
+		drawToggle(entityButton, entityCountEnabled, hoverEntity, L"ENTITY COUNT: ON", L"ENTITY COUNT: OFF");
 	}
 
 	inline void shutdown() {
 		tracersEnabled = false;
+		threeDBoxesEnabled = false;
+		fovCircleEnabled = false;
 		coordinatesEnabled = false;
 		speedEnabled = false;
 		directionEnabled = false;
+		entityCountEnabled = false;
 		menuLeftWasDown = false;
+		cachedTelemetryValid = false;
+		lastTelemetryRefresh = 0;
 	}
 }
