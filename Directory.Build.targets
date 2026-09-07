@@ -11,4 +11,14 @@
     <LibraryPath>$(ProjectDir)minhook;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);$(NETFXKitsDir)Lib\um\x64</LibraryPath>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(ProjectDir)include;$(ProjectDir)include\glm;$(IncludePath)</IncludePath>
   </PropertyGroup>
+
+  <!-- Keep symbols in Release while we identify modern Bedrock crashes. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
+    <ClCompile>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
 </Project>
