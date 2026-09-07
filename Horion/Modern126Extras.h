@@ -4,6 +4,7 @@
 #include "Modern126Visuals.h"
 #include <d2d1_1.h>
 #include <dwrite.h>
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
 
